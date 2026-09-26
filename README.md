@@ -39,6 +39,18 @@ overflowed the native stack instead of returning `Error::RecursionLimit`.
 
 Run `cargo run --example interpreter` for a plugin-style interpreter that uses all three modules together.
 
+## Limits
+
+Three bounds exist because the alternative was a hang or a wrong answer, not because of caution.
+
+- **Prototype chains: 64 links** (`MAX_PROTO_DEPTH`) → `Error::ProtoCycle`. The links are writable from safe code, so an unguarded walk spins forever at constant memory, which no allocator-based watchdog can catch.
+- **Call depth: 256 per thread** (`CallCtx::DEFAULT_MAX_DEPTH`) → `Error::RecursionLimit`. The counter is a thread-local, so a body that builds a fresh `CallCtx` cannot buy itself a new budget.
+- **Printing: 64 levels and 64 entries per level** (`MAX_PRINT_DEPTH`, `MAX_PRINT_ENTRIES`). Cyclic graphs are legal, and a flat 2000-element list has no depth to bound.
+
+A `Gc` captured by a `NativeFn` body is **sound but never reclaimed** — see [below](#a-body-may-hold-gc-cells-and-that-leaks) for why `boa_gc`'s refcount rooting makes such a cell a permanent root. Capture small things; hand bulk data to an explicit cell you control the lifetime of.
+
+Each bound in detail, and the acyclic cases that still resolve: [Bounds you should know about](#bounds-you-should-know-about).
+
 ## Why this exists
 
 Rust has a garbage collector problem, but not the one people usually mean. Two decisions were made long ago and neither is reversible:
@@ -134,7 +146,7 @@ Three limits exist because the alternative was a hang or a wrong answer, not bec
 
 - **Prototype chains are bounded at 64 links** (`MAX_PROTO_DEPTH`), reported as `Error::ProtoCycle`. Prototype links are writable, so `a.obj_set_proto(&b); b.obj_set_proto(&a)` is legal from safe code and every reader would otherwise spin forever at constant memory — which no allocator-based watchdog can catch. A 64-deep *acyclic* chain still resolves.
 - **Recursion is bounded at 256 per thread**, reported as `Error::RecursionLimit`. The counter is a thread-local, not a `CallCtx` field, on purpose: a body that constructs a fresh `CallCtx` and recurses through that must not get a fresh budget. The trade-off is that two `CallCtx`s on one thread share one budget.
-- **Printing is bounded in depth** at 64, not in width. A 2000-property object renders 2000 entries.
+- **Printing is bounded in depth at 64 and in width at 64 entries per level** (`MAX_PRINT_DEPTH` and `MAX_PRINT_ENTRIES`). Depth alone is not enough: a 2000-property object is one level deep, so it would render 2000 entries. It now renders 64 and then `... (1936 more)`. Width is bounded per level, not in total, so a very wide graph still grows.
 
 ## What this is not
 
@@ -181,7 +193,7 @@ assert_eq!(v.as_user::<Point>().unwrap().x, 1.0);
 
 ## Status
 
-Early, and specific about what that means. **87 tests** (52 value, 11 registry, 10 dyn_fn, 8 convert, 6 doctests), `cargo clippy --all-targets -- -D warnings` clean, `cargo doc` clean under `-D warnings`.
+Early, and specific about what that means. **102 tests** (61 value, 12 registry, 10 dyn_fn, 12 convert, 7 doctests), `cargo clippy --all-targets -- -D warnings` clean, `cargo doc` clean under `-D warnings`.
 
 An adversarial audit found 14 bugs in 0.1.0, three of them critical. All critical and major ones are fixed, each with a regression test:
 
@@ -194,7 +206,14 @@ An adversarial audit found 14 bugs in 0.1.0, three of them critical. All critica
 
 That audit also found that the crate's headline claim was false. 0.1.0 shipped an "explicit capture list" justified as preventing a use-after-free; it prevented nothing, because a `Gc` in ordinary Rust memory is already a permanent root, and the *actual* failure was a 100% permanent leak that the capture list could not fix. The list is deleted and the leak is documented instead.
 
-**Not fixed** (known, not hidden): dead variants `Error::Arity` and `RegistryError::NotSendSync`; `From<u64> for Value` truncates; `usize` conversion reports `expected: "i64"`; `Object::keys()` is own-only while `get` walks the chain; `list_pop` on empty reports a hard-coded index; `ValueMap` insert is O(n) so building is O(n²); no `list_set`/`list_insert`/`list_remove`.
+A second pass cleared the remaining minor tier, each with a test:
+
+- `From<u64> for Value` cast with `as i64`, so `u64::MAX` parsed out of a config file became `-1` with no error. It is now `TryFrom<u64>` → `Error::OutOfRange`, and a compile-fail test proves no infallible path is left.
+- `usize::from_value` wrapped a negative int to `usize::MAX` and reported `expected: "i64"`. It now reports `Error::NegativeToUnsigned` and names the type asked for.
+- The dead variants `Error::Arity` and `RegistryError::NotSendSync` are gone, as is the unconstructible half of `Registry::values`' bounds.
+- `list_set`/`list_insert`/`list_remove`/`list_clear`/`list_iter`, `map_contains`/`map_get_str`/`map_try_insert`/`map_keys`/`map_clear` and `obj_has_own`/`obj_keys`/`obj_class` exist, plus `Object::has_own`.
+
+**Not fixed** (known, not hidden): `ValueMap` insert is O(n) so building a large map is O(n²); `Value` deliberately has no `Hash`, so every map lookup is a linear scan; `MAX_PRINT_ENTRIES` bounds width per level rather than the total width of a very wide graph.
 
 **Unverified:** MSRV is claimed as 1.91 (inherited from `boa_gc` 0.22) but only the CI job can confirm it. The statement that `rust-lang/rfcs` contains no GC or dynamism RFC was true when written and needs re-checking before each release.
 

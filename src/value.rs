@@ -25,6 +25,17 @@ use crate::error::{Error, Result};
 /// Cyclic graphs are legal, so any unbounded structural printer would hang.
 pub const MAX_PRINT_DEPTH: usize = 64;
 
+/// Maximum number of entries [`fmt::Display`] and [`fmt::Debug`] will render
+/// inside one list, map or object before summarising the rest as
+/// `... (N more)`.
+///
+/// The companion bound to [`MAX_PRINT_DEPTH`]. Depth alone does not bound
+/// output width: a flat list of 2000 integers is one level deep and renders
+/// 2000 entries, so a single untrusted value could produce a log line of
+/// arbitrary length. This bounds width per level, not the total — a wide graph
+/// still grows, but at least nothing is unbounded at one level.
+pub const MAX_PRINT_ENTRIES: usize = 64;
+
 /// Maximum number of prototype links [`Object::get`], [`Object::has`],
 /// [`Object::chain_len`] and [`Value::as_callable`] will follow before giving
 /// up with [`Error::ProtoCycle`].
@@ -464,6 +475,9 @@ impl Object {
 
     /// Whether a property is reachable, including through the prototype chain.
     ///
+    /// This walks; [`Object::has_own`] does not. See the asymmetry note on
+    /// [`Object::keys`].
+    ///
     /// # Errors
     ///
     /// Propagates [`Error::BorrowConflict`] and [`Error::ProtoCycle`] from
@@ -472,12 +486,30 @@ impl Object {
     pub fn has(&self, key: &str) -> Result<bool> {
         self.get(key).map(|v| v.is_some())
     }
+
+    /// Whether this object has an own property `key`, ignoring the chain.
+    ///
+    /// The cheap and unambiguous form of the question. See the asymmetry note
+    /// on [`Object::keys`] for when to prefer this over [`Object::has`].
+    pub fn has_own(&self, key: &str) -> bool {
+        self.props.contains_key(&Value::str(key))
+    }
+
     /// Number of own properties, excluding the prototype chain.
+    ///
+    /// Own-only, like [`Object::keys`] and [`Object::is_empty`]; an object whose
+    /// every property is inherited has `len() == 0` while [`Object::get`]
+    /// succeeds. Use [`Object::has`] to ask about reachability.
     pub fn len(&self) -> usize {
         self.props.len()
     }
 
     /// Whether this object has no own properties.
+    ///
+    /// Own-only, like [`Object::keys`] and [`Object::len`]. `is_empty() == true`
+    /// does **not** mean nothing is readable: a fully inherited object is empty
+    /// here and non-empty as far as [`Object::get`] and [`Object::has`] are
+    /// concerned.
     pub fn is_empty(&self) -> bool {
         self.props.is_empty()
     }
@@ -488,6 +520,22 @@ impl Object {
     }
 
     /// Own property names, in insertion order.
+    ///
+    /// # Own-only, on purpose
+    ///
+    /// [`Object::get`], [`Object::has`] and [`Object::lookup`] follow the
+    /// prototype chain; `keys`, [`Object::len`] and [`Object::is_empty`] do
+    /// not. The split is deliberate and it is a real asymmetry rather than an
+    /// oversight: enumerating a chain is unbounded work whose size is not
+    /// knowable without walking it, walking it can hit
+    /// [`Error::ProtoCycle`] or [`Error::BorrowConflict`], and it can shadow
+    /// keys. So `keys` stays cheap and predictable, and the caller decides
+    /// whether that is the question they meant to ask.
+    ///
+    /// The consequence worth internalising: an object that inherits everything
+    /// prints as `{}`, reports `len() == 0`, and still answers
+    /// [`Object::get`]. To test for an own property specifically, use
+    /// [`Object::has_own`]; to test for reachability, use [`Object::has`].
     pub fn keys(&self) -> Vec<&str> {
         self.props
             .keys()
@@ -1003,8 +1051,98 @@ impl Value {
     }
 
     /// Remove and return the last list element.
+    ///
+    /// # Error on an empty list
+    ///
+    /// [`Error::IndexOutOfBounds`] with `index: 0, len: 0`. Both numbers are
+    /// read off the list rather than asserted: `Vec::pop` returning `None`
+    /// *proves* the length is zero, and with a zero length the last position
+    /// that could have been popped is 0. A dedicated "empty list" variant
+    /// would name nothing a caller can act on differently — the condition is
+    /// exactly "index 0 is not there".
     pub fn list_pop(&self) -> Result<Value> {
-        self.with_list(|l| l.pop().ok_or(Error::IndexOutOfBounds { index: 0, len: 0 }))?
+        self.with_list(|l| {
+            l.pop().ok_or(Error::IndexOutOfBounds {
+                index: l.len().saturating_sub(1),
+                len: l.len(),
+            })
+        })?
+    }
+
+    /// Overwrite the element at `index`.
+    ///
+    /// A new length is never implied: the list keeps its size, so this is
+    /// distinct from [`Value::list_push`] and [`Value::list_insert`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::IndexOutOfBounds`] if `index >= len`. Assigning at exactly `len`
+    /// would be an append, and [`Value::list_push`] is the way to say that.
+    pub fn list_set(&self, index: usize, value: Value) -> Result<()> {
+        self.with_list(|l| {
+            if index >= l.len() {
+                return Err(Error::IndexOutOfBounds {
+                    index,
+                    len: l.len(),
+                });
+            }
+            l[index] = value;
+            Ok(())
+        })?
+    }
+
+    /// Insert at `index`, shifting the tail right.
+    ///
+    /// `index == len` appends, matching [`Vec::insert`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::IndexOutOfBounds`] if `index > len`. `Vec::insert` panics
+    /// there, and this crate does not panic on input reachable from safe code.
+    pub fn list_insert(&self, index: usize, value: Value) -> Result<()> {
+        self.with_list(|l| {
+            if index > l.len() {
+                return Err(Error::IndexOutOfBounds {
+                    index,
+                    len: l.len(),
+                });
+            }
+            l.insert(index, value);
+            Ok(())
+        })?
+    }
+
+    /// Remove the element at `index`, shifting the tail left, and return it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::IndexOutOfBounds`] if `index >= len`.
+    pub fn list_remove(&self, index: usize) -> Result<Value> {
+        self.with_list(|l| {
+            if index >= l.len() {
+                return Err(Error::IndexOutOfBounds {
+                    index,
+                    len: l.len(),
+                });
+            }
+            Ok(l.remove(index))
+        })?
+    }
+
+    /// The list's elements, in order, as owned clones.
+    ///
+    /// Clones rather than borrows by necessity: a borrow of the backing
+    /// [`GcRefCell`] cannot outlive the call that takes it, so an iterator
+    /// lending out `&Value` would not be able to escape this signature. The
+    /// clone is one `Gc` bump per element — [`Value::Str`] and the container
+    /// variants share a cell, and the scalars are `Copy`.
+    pub fn list_iter(&self) -> Result<Vec<Value>> {
+        self.with_list_ref(|l| l.to_vec())
+    }
+
+    /// Remove every element, keeping the list itself alive.
+    pub fn list_clear(&self) -> Result<()> {
+        self.with_list(|l| l.clear())
     }
 
     /// Number of entries in a map.
@@ -1017,14 +1155,54 @@ impl Value {
         self.with_map_ref(|m| m.get(key).cloned().ok_or(Error::KeyNotFound))?
     }
 
+    /// Read a map entry under a string key.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::KeyNotFound`] if absent — the map has no prototype chain, so
+    /// unlike [`Value::obj_get`] there is no walk that could fail for another
+    /// reason.
+    pub fn map_get_str(&self, key: &str) -> Result<Value> {
+        self.map_get(&Value::str(key))
+    }
+
+    /// Whether a map entry exists.
+    pub fn map_contains(&self, key: &Value) -> Result<bool> {
+        self.with_map_ref(|m| m.contains_key(key))
+    }
+
     /// Write a map entry, returning the previous value if any.
     pub fn map_insert(&self, key: Value, value: Value) -> Result<Option<Value>> {
         self.with_map(|m| m.insert(key, value))
     }
 
+    /// Write a map entry, refusing to replace an existing one.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::DuplicateKey`]. The write is all-or-nothing: nothing is
+    /// inserted when the key is already present.
+    pub fn map_try_insert(&self, key: Value, value: Value) -> Result<()> {
+        self.with_map(|m| m.try_insert(key, value))?
+    }
+
     /// Remove a map entry.
     pub fn map_remove(&self, key: &Value) -> Result<Option<Value>> {
         self.with_map(|m| m.remove(key))
+    }
+
+    /// The map's keys, in insertion order, as owned clones.
+    ///
+    /// Clones for the same reason as [`Value::list_iter`]: the borrow of the
+    /// backing cell cannot outlive this call. Existing keys keep their original
+    /// position when overwritten, so the order is first-insertion.
+    pub fn map_keys(&self) -> Result<Vec<Value>> {
+        self.with_map_ref(|m| m.keys().cloned().collect())
+    }
+
+    /// Remove every map entry, keeping the map itself alive.
+    pub fn map_clear(&self) -> Result<()> {
+        self.with_map(|m| m.clear())
     }
 
     /// Set an object property, returning the previous own value if any.
@@ -1046,8 +1224,34 @@ impl Value {
     }
 
     /// Whether an object property is reachable through the prototype chain.
+    ///
+    /// Walks; [`Value::obj_has_own`] does not. See the asymmetry note on
+    /// [`Object::keys`].
     pub fn obj_has(&self, key: &str) -> Result<bool> {
         self.with_object_ref(|o| o.has(key))?
+    }
+
+    /// Whether an object has an own property, ignoring the prototype chain.
+    ///
+    /// The cheap and unambiguous form of the question. `obj_has` walks, so
+    /// `obj_has_own(k) == false` with `obj_has(k) == true` is a perfectly
+    /// ordinary inheritance result, not a contradiction.
+    pub fn obj_has_own(&self, key: &str) -> Result<bool> {
+        self.with_object_ref(|o| o.has_own(key))
+    }
+
+    /// An object's own property names, in insertion order, as owned strings.
+    ///
+    /// Own-only and bounded by neither the chain nor a print limit, so an
+    /// object with a million own properties returns a million names. Clone
+    /// rather than borrow for the same reason as [`Value::list_iter`].
+    pub fn obj_keys(&self) -> Result<Vec<String>> {
+        self.with_object_ref(|o| o.keys().into_iter().map(str::to_owned).collect())
+    }
+
+    /// An object's class name, if it was given one.
+    pub fn obj_class(&self) -> Result<Option<String>> {
+        self.with_object_ref(|o| o.class().map(str::to_owned))
     }
 
     /// An object value's prototype, as a shareable handle.
@@ -1151,21 +1355,24 @@ impl Value {
             Value::Bytes(b) => write!(f, "<{} bytes>", b.len()),
             Value::List(l) => match l.try_borrow() {
                 Ok(items) => {
+                    let shown = items.len().min(MAX_PRINT_ENTRIES);
                     f.write_str("[")?;
-                    for (i, v) in items.iter().enumerate() {
+                    for (i, v) in items.iter().take(shown).enumerate() {
                         if i > 0 {
                             f.write_str(", ")?;
                         }
                         v.fmt_at(f, depth + 1)?;
                     }
+                    write_elision(f, items.len() - shown)?;
                     f.write_str("]")
                 }
                 Err(_) => f.write_str("[<borrowed>]"),
             },
             Value::Map(m) => match m.try_borrow() {
                 Ok(entries) => {
+                    let shown = entries.len().min(MAX_PRINT_ENTRIES);
                     f.write_str("{")?;
-                    for (i, (k, v)) in entries.iter().enumerate() {
+                    for (i, (k, v)) in entries.iter().take(shown).enumerate() {
                         if i > 0 {
                             f.write_str(", ")?;
                         }
@@ -1173,6 +1380,7 @@ impl Value {
                         f.write_str(": ")?;
                         v.fmt_at(f, depth + 1)?;
                     }
+                    write_elision(f, entries.len() - shown)?;
                     f.write_str("}")
                 }
                 Err(_) => f.write_str("{<borrowed>}"),
@@ -1184,7 +1392,8 @@ impl Value {
                         None => f.write_str("{")?,
                     }
                     let keys = obj.keys();
-                    for (i, k) in keys.iter().enumerate() {
+                    let shown = keys.len().min(MAX_PRINT_ENTRIES);
+                    for (i, k) in keys.iter().take(shown).enumerate() {
                         if i > 0 {
                             f.write_str(", ")?;
                         }
@@ -1196,6 +1405,7 @@ impl Value {
                             Err(_) => f.write_str("<unreadable>")?,
                         }
                     }
+                    write_elision(f, keys.len() - shown)?;
                     f.write_str("}")
                 }
                 Err(_) => f.write_str("{<borrowed>}"),
@@ -1204,5 +1414,17 @@ impl Value {
             Value::User(u) => write!(f, "<user {:?}>", u.type_id()),
             Value::Type(t) => write!(f, "<type {t:?}>"),
         }
+    }
+}
+
+/// Render the `, ... (N more)` tail of a container truncated at
+/// [`MAX_PRINT_ENTRIES`], or nothing at all when nothing was dropped.
+///
+/// Only ever called with a non-zero `omitted` count when the container was
+/// non-empty, so the leading separator can never dangle.
+fn write_elision(f: &mut fmt::Formatter<'_>, omitted: usize) -> fmt::Result {
+    match omitted {
+        0 => Ok(()),
+        _ => write!(f, ", ... ({omitted} more)"),
     }
 }

@@ -28,8 +28,6 @@ pub enum RegistryError {
     /// A value of that type is already registered, and the operation refused
     /// to replace it.
     AlreadyPresent(TypeId),
-    /// A registered value was not [`Send`] plus [`Sync`].
-    NotSendSync(&'static str),
 }
 
 impl std::fmt::Display for RegistryError {
@@ -37,9 +35,6 @@ impl std::fmt::Display for RegistryError {
         match self {
             RegistryError::NotFound(t) => write!(f, "no value registered for type {t:?}"),
             RegistryError::AlreadyPresent(t) => write!(f, "type {t:?} is already registered"),
-            RegistryError::NotSendSync(ty) => {
-                write!(f, "type {ty} is not Send + Sync and cannot be registered")
-            }
         }
     }
 }
@@ -133,7 +128,13 @@ impl Registry {
     }
 
     /// Iterate over registered values whose type is `R`, in unspecified order.
-    pub fn values<R: 'static>(&self) -> impl Iterator<Item = &R> {
+    ///
+    /// `R` carries the same `Send + Sync + 'static` bounds as the inserting
+    /// methods. Without them, `Slot` being `Box<dyn Any + Send + Sync>` would
+    /// make `downcast_ref::<R>()` fail for every element and hand back a
+    /// silently empty iterator — the absence a typed lookup is supposed to
+    /// rule out.
+    pub fn values<R: Send + Sync + 'static>(&self) -> impl Iterator<Item = &R> {
         self.slots.values().filter_map(|s| s.downcast_ref::<R>())
     }
 }

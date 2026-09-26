@@ -61,6 +61,32 @@ fn try_get_reports_the_missing_type() {
     );
 }
 
+// `Slot` is `Box<dyn Any + Send + Sync>`, so `values::<R>` used to accept a
+// non-`Send` `R` and yield an empty iterator — observationally identical to
+// "nothing of that type is registered", which is the one thing a typed lookup
+// exists to rule out. The bound makes that a compile error, so what is left to
+// pin is only that typed iteration still works for the types that can be
+// registered at all.
+#[test]
+fn typed_iteration_covers_exactly_the_registered_types() {
+    let mut r = Registry::new();
+    r.insert("only".to_owned());
+    r.insert(7u32);
+    r.insert(vec![1u8, 2]);
+
+    assert_eq!(
+        r.values::<String>().map(String::as_str).collect::<Vec<_>>(),
+        vec!["only"]
+    );
+    assert_eq!(r.values::<u32>().copied().collect::<Vec<_>>(), vec![7]);
+    assert_eq!(
+        r.values::<i32>().count(),
+        0,
+        "an absent type yields nothing"
+    );
+    assert_eq!(r.values::<Vec<u8>>().count(), 1);
+}
+
 #[test]
 fn remove_takes_the_value_out() {
     let mut r = Registry::new();

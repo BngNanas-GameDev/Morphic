@@ -12,15 +12,6 @@ pub type Result<T, E = Error> = core::result::Result<T, E>;
 pub enum Error {
     /// A value that is not callable was called.
     NotCallable,
-    /// A native function was called with the wrong number of arguments.
-    Arity {
-        /// Name of the native function.
-        name: String,
-        /// Argument count the function accepts.
-        expected: usize,
-        /// Argument count that was supplied.
-        found: usize,
-    },
     /// A value had the wrong shape for the requested operation.
     TypeMismatch {
         /// The operation that failed, e.g. `"Value::as_int"`.
@@ -36,6 +27,31 @@ pub enum Error {
         index: usize,
         /// The length of the list.
         len: usize,
+    },
+    /// A number could not be represented without changing its value.
+    ///
+    /// Always a narrowing failure, so `requested` is a `u64` and `max` is the
+    /// largest representable value *for the direction that failed*. Converting
+    /// a `u64` above [`i64::MAX`] into a [`Value::Int`](crate::Value::Int) is
+    /// the motivating case: a `From<u64> for Value` that cast instead would
+    /// turn `u64::MAX` into `-1` and report no error at all.
+    OutOfRange {
+        /// The value that was offered.
+        requested: u64,
+        /// The largest value that can be represented.
+        max: u64,
+    },
+    /// A negative integer was read into an unsigned type.
+    ///
+    /// Distinct from [`Error::OutOfRange`] because the value is the wrong sign
+    /// rather than too large, and a caller usually wants to treat the two
+    /// differently: a negative length is malformed input, an over-wide one is
+    /// merely unrepresentable.
+    NegativeToUnsigned {
+        /// The operation that failed, e.g. `"parse_len"`.
+        context: &'static str,
+        /// The negative value that was found.
+        found: i64,
     },
     /// A map or object did not contain the requested key.
     ///
@@ -69,11 +85,6 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::NotCallable => f.write_str("value is not callable"),
-            Error::Arity {
-                name,
-                expected,
-                found,
-            } => write!(f, "`{name}` expected {expected} argument(s), got {found}"),
             Error::TypeMismatch {
                 context,
                 expected,
@@ -81,6 +92,12 @@ impl fmt::Display for Error {
             } => write!(f, "{context} expected {expected}, found {found}"),
             Error::IndexOutOfBounds { index, len } => {
                 write!(f, "index {index} out of bounds for length {len}")
+            }
+            Error::OutOfRange { requested, max } => {
+                write!(f, "{requested} is out of range, and the maximum is {max}")
+            }
+            Error::NegativeToUnsigned { context, found } => {
+                write!(f, "{context} expected a non-negative int, found {found}")
             }
             Error::KeyNotFound => f.write_str("key not found"),
             Error::ProtoCycle { limit } => {

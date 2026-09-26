@@ -12,6 +12,25 @@ use crate::value::Value;
 /// Blanket-implemented for the scalar shapes, so `Value::from(1i64)` and
 /// `Into::<Value>::into("hi")` both work. Implement it for your own type to
 /// make it first-class.
+///
+/// # `u64` is deliberately absent
+///
+/// The covered integers are `i8`–`i64` and `u8`–`u32`. `u64` is left out on
+/// purpose: the top half of its range does not fit [`Value::Int`], and
+/// `into_value` has no way to report that — an infallible conversion that
+/// silently rewrites `u64::MAX` as `-1` is worse than no conversion at all.
+/// Use [`Value::try_from`] instead, which returns [`Error::OutOfRange`] for
+/// anything above `i64::MAX`.
+///
+/// Note that the conversion has to be *named* in the type position, as in
+/// `let v = Value::try_from(n)?`. The usual `n.try_into()` spelling is
+/// ambiguous here, because `u64: TryInto<u64>` already resolves and shadows
+/// the `Value` target.
+///
+/// # Related traits
+///
+/// Reading a [`Value`] back out is [`FromValue`], which can fail and so is
+/// deliberately a separate trait.
 pub trait IntoValue {
     /// Perform the conversion.
     fn into_value(self) -> Value;
@@ -22,6 +41,14 @@ pub trait IntoValue {
 /// Deliberately separate from [`IntoValue`]: converting `f64` into a `Value`
 /// should always succeed, while reading one back as `i64` may legitimately
 /// fail. A single `From` pair could not express that asymmetry.
+///
+/// # No conversion is lossy
+///
+/// Every implementation either produces the value the caller asked for or
+/// returns an [`Error`]. In particular [`usize`] and [`isize`] report
+/// [`Error::NegativeToUnsigned`] rather than wrapping a negative [`Value::Int`]
+/// around to a huge length, and the type error names the type that was asked
+/// for rather than the [`i64`] the implementation reads.
 pub trait FromValue: Sized {
     /// Attempt the conversion, naming `context` in any type error.
     fn from_value(value: &Value, context: &'static str) -> Result<Self>;
@@ -56,17 +83,56 @@ macro_rules! into_value_int {
 
 into_value_int!(i8, i16, i32, i64, u8, u16, u32);
 
-macro_rules! from_value_lossy_int {
-    ($($t:ty),* $(,)?) => {$(
-        impl FromValue for $t {
-            fn from_value(value: &Value, context: &'static str) -> Result<Self> {
-                <i64 as FromValue>::from_value(value, context).map(|i| i as $t)
+/// `usize` must not wrap a negative [`Value::Int`].
+///
+/// The obvious one-liner — read the [`i64`] and `as usize` — turns `-1` into
+/// `usize::MAX`, which is the most dangerous possible result for the values
+/// this type is read from: a length, an offset, an index. There is no
+/// defensible reading of a negative length.
+impl FromValue for usize {
+    fn from_value(value: &Value, context: &'static str) -> Result<Self> {
+        let raw = match value {
+            Value::Int(i) => *i,
+            other => {
+                return Err(Error::TypeMismatch {
+                    context,
+                    expected: "usize",
+                    found: other.type_name(),
+                });
             }
-        }
-    )*};
+        };
+        usize::try_from(raw).map_err(|_| Error::NegativeToUnsigned {
+            context,
+            found: raw,
+        })
+    }
 }
 
-from_value_lossy_int!(isize, usize);
+/// `isize` keeps the sign, but still refuses to truncate.
+///
+/// [`i64::try_from`] is not involved: on any target this crate supports
+/// `isize` is at least 64 bits wide, so the conversion is a lossless
+/// reinterpretation. The `try_from` is there so a hypothetical narrower
+/// target reports [`Error::OutOfRange`] instead of silently dropping the top
+/// bits.
+impl FromValue for isize {
+    fn from_value(value: &Value, context: &'static str) -> Result<Self> {
+        let raw = match value {
+            Value::Int(i) => *i,
+            other => {
+                return Err(Error::TypeMismatch {
+                    context,
+                    expected: "isize",
+                    found: other.type_name(),
+                });
+            }
+        };
+        isize::try_from(raw).map_err(|_| Error::OutOfRange {
+            requested: raw.unsigned_abs(),
+            max: isize::MAX as u64,
+        })
+    }
+}
 
 impl IntoValue for f32 {
     fn into_value(self) -> Value {
@@ -197,9 +263,37 @@ impl From<i64> for Value {
     }
 }
 
-impl From<u64> for Value {
-    fn from(v: u64) -> Self {
-        Value::Int(v as i64)
+/// A `u64` becomes a [`Value::Int`] only if it fits.
+///
+/// There is deliberately no `From<u64> for Value`. The infallible version
+/// existed and cast with `as i64`, so `u64::MAX` became `-1` with no error —
+/// and the crate's flagship use case is parsing config, where a large
+/// identifier becomes a wrong value rather than a failure. Absence of the
+/// `From` impl is enforced by the compiler, not by convention: `core` blanket-
+/// implements `TryFrom<U> for T` wherever `U: Into<T>`, so a `From<u64>` and
+/// this `TryFrom<u64>` cannot both exist.
+///
+/// ```
+/// use morphic::{Error, Value};
+///
+/// assert_eq!(Value::try_from(7u64).unwrap(), Value::int(7));
+///
+/// assert_eq!(
+///     Value::try_from(u64::MAX),
+///     Err(Error::OutOfRange { requested: u64::MAX, max: i64::MAX as u64 })
+/// );
+/// ```
+impl TryFrom<u64> for Value {
+    type Error = Error;
+
+    fn try_from(v: u64) -> Result<Self> {
+        match i64::try_from(v) {
+            Ok(narrowed) => Ok(Value::Int(narrowed)),
+            Err(_) => Err(Error::OutOfRange {
+                requested: v,
+                max: i64::MAX as u64,
+            }),
+        }
     }
 }
 

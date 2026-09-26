@@ -1,6 +1,6 @@
 use morphic::{
-    CALL_PROP, CallCtx, Error, Finalize, FromValue, Gc, GcRefCell, MAX_PROTO_DEPTH, NativeFn,
-    Object, Trace, Value, ValueMap,
+    CALL_PROP, CallCtx, Error, Finalize, FromValue, Gc, GcRefCell, MAX_PRINT_ENTRIES,
+    MAX_PROTO_DEPTH, NativeFn, Object, Trace, Value, ValueMap,
 };
 
 /// `Value::call` was deliberately removed from the public API: it built a fresh
@@ -79,6 +79,19 @@ fn popping_an_empty_list_is_an_error_not_a_panic() {
     assert!(Value::list().list_pop().is_err());
 }
 
+#[test]
+fn popping_an_empty_list_reports_the_position_that_is_not_there() {
+    // Deliberately not a new `Error::EmptyList`. `Vec::pop` returning `None`
+    // proves the length is 0, and with a 0 length the last position that could
+    // have been popped is 0, so `IndexOutOfBounds { index: 0, len: 0 }` is a
+    // true statement rather than a hard-coded guess. Any `pop` of a non-empty
+    // list succeeds, so this pair is the only one the error can ever carry.
+    assert_eq!(
+        Value::list().list_pop().unwrap_err(),
+        Error::IndexOutOfBounds { index: 0, len: 0 }
+    );
+}
+
 // ------------------------------------------------------------ cycles, GC
 
 #[test]
@@ -130,6 +143,55 @@ fn a_cyclic_map_prints_within_the_depth_budget() {
     let map = Value::map();
     map.map_insert(Value::str("self"), map.clone()).unwrap();
     assert!(format!("{map}").contains("..."));
+}
+
+// MAX_PRINT_DEPTH bounds depth only, so a flat 2000-element list used to
+// render 2000 entries. MAX_PRINT_ENTRIES is the width companion.
+#[test]
+fn wide_containers_are_truncated_with_a_count_of_what_is_missing() {
+    let omitted = 200 - MAX_PRINT_ENTRIES;
+    let tail = format!(", ... ({omitted} more)");
+
+    let list = Value::list_from((0..200i64).map(Value::int));
+    let rendered = format!("{list}");
+    assert!(
+        rendered.starts_with('[') && rendered.ends_with(']'),
+        "{rendered}"
+    );
+    assert!(rendered.contains(&tail), "{rendered}");
+    assert!(
+        rendered.len() < 1024,
+        "{} chars, so the width budget is not doing its job",
+        rendered.len()
+    );
+    let shown = rendered
+        .strip_prefix('[')
+        .and_then(|b| b.strip_suffix(']'))
+        .and_then(|b| b.split_once(&tail))
+        .map(|(head, _)| head.split(", ").count())
+        .unwrap_or_else(|| panic!("no elision tail in {rendered}"));
+    assert_eq!(shown, MAX_PRINT_ENTRIES, "in {rendered}");
+
+    let map = Value::map_from((0..200).map(|i| (Value::int(i), Value::int(i))));
+    assert!(format!("{map}").contains(&tail));
+
+    let obj = Value::object();
+    for i in 0..200 {
+        obj.obj_set(&format!("k{i}"), Value::int(i)).unwrap();
+    }
+    let rendered = format!("{obj}");
+    assert!(rendered.contains(&tail), "{rendered}");
+
+    // A container that fits is not annotated, and Debug agrees with Display.
+    let small = Value::list_from([Value::int(1), Value::int(2)]);
+    assert_eq!(format!("{small}"), "[1, 2]");
+    assert_eq!(format!("{small:?}"), "[1, 2]");
+
+    let exact = Value::list_from((0..MAX_PRINT_ENTRIES as i64).map(Value::int));
+    assert!(
+        !format!("{exact}").contains("more"),
+        "exactly at the budget must not claim an elision"
+    );
 }
 
 // ------------------------------------------------------------------ maps
@@ -304,6 +366,47 @@ fn object_chain_length_is_reported() {
 #[test]
 fn attaching_a_non_object_prototype_is_rejected() {
     assert!(Value::object().obj_set_proto(&Value::int(1)).is_err());
+}
+
+/// `keys`, `len` and `is_empty` are own-only while `get`, `has` and `lookup`
+/// walk the chain. That split is documented on `Object::keys`; this pins it.
+#[test]
+fn an_own_only_view_and_a_chain_walking_view_can_disagree() {
+    let proto = Value::object_of_class("Base");
+    proto.obj_set("inherited", Value::int(1)).unwrap();
+    proto.obj_set("shadowed", Value::int(0)).unwrap();
+
+    let obj = Value::object_of_class("Child");
+    obj.obj_set_proto(&proto).unwrap();
+    obj.obj_set("own", Value::int(2)).unwrap();
+
+    assert_eq!(obj.obj_keys().unwrap(), vec!["own".to_owned()]);
+    assert!(obj.obj_has_own("own").unwrap());
+    assert!(!obj.obj_has_own("inherited").unwrap());
+    assert!(obj.obj_has("inherited").unwrap());
+    assert!(obj.with_object_ref(|o| o.has_own("own")).unwrap());
+    assert!(!obj.with_object_ref(|o| o.has_own("inherited")).unwrap());
+
+    // Shadowing counts as owning the key.
+    obj.obj_set("shadowed", Value::int(9)).unwrap();
+    assert!(obj.obj_has_own("shadowed").unwrap());
+    assert_eq!(obj.obj_get("shadowed").unwrap().as_int(), Some(9));
+
+    // An object that inherits everything looks empty, and reads fine.
+    let bare = Value::object();
+    bare.obj_set_proto(&proto).unwrap();
+    assert_eq!(bare.obj_keys().unwrap(), Vec::<String>::new());
+    assert_eq!(bare.with_object_ref(|o| o.len()).unwrap(), 0);
+    assert!(bare.with_object_ref(|o| o.is_empty()).unwrap());
+    assert!(!bare.obj_has_own("inherited").unwrap());
+    assert!(bare.obj_has("inherited").unwrap());
+    assert_eq!(bare.obj_get("inherited").unwrap().as_int(), Some(1));
+    assert_eq!(format!("{bare}"), "{}");
+
+    // Removing an own property hands the name back to the prototype.
+    obj.obj_remove("own").unwrap();
+    assert!(!obj.obj_has_own("own").unwrap());
+    assert!(obj.obj_has("own").is_err());
 }
 
 // B1 regression: a prototype cycle used to spin forever at constant memory.
@@ -804,6 +907,243 @@ fn mismatch_on_the_wrong_shape_is_descriptive() {
     );
     assert!(Value::int(1).with_map(|_| ()).is_err());
     assert!(Value::int(1).with_object(|_| ()).is_err());
+}
+
+// ----------------------------------------------------------------- mutators
+
+#[test]
+fn list_mutators_cover_the_sequence_operations() {
+    let list = Value::list_from([Value::int(1), Value::int(2), Value::int(3)]);
+
+    list.list_set(1, Value::int(20)).unwrap();
+    assert_eq!(list.list_get(1).unwrap().as_int(), Some(20));
+    assert_eq!(list.list_len().unwrap(), 3, "set never changes the length");
+
+    list.list_insert(1, Value::int(15)).unwrap();
+    assert_eq!(list.list_len().unwrap(), 4);
+    assert_eq!(list.list_get(1).unwrap().as_int(), Some(15));
+    assert_eq!(list.list_get(2).unwrap().as_int(), Some(20));
+
+    list.list_insert(4, Value::int(4)).unwrap();
+    assert_eq!(
+        list.list_get(4).unwrap().as_int(),
+        Some(4),
+        "index == len appends"
+    );
+
+    assert_eq!(list.list_remove(0).unwrap().as_int(), Some(1));
+    assert_eq!(list.list_len().unwrap(), 4);
+
+    let seen: Vec<i64> = list
+        .list_iter()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_int)
+        .collect();
+    assert_eq!(seen, vec![15, 20, 3, 4]);
+
+    list.list_clear().unwrap();
+    assert_eq!(list.list_len().unwrap(), 0);
+    assert_eq!(list.list_iter().unwrap(), Vec::<Value>::new());
+}
+
+#[test]
+fn list_index_errors_name_the_index_and_length() {
+    let list = Value::list_from([Value::int(1)]);
+    assert_eq!(
+        list.list_set(1, Value::Nil),
+        Err(Error::IndexOutOfBounds { index: 1, len: 1 }),
+        "set at len is an append, not an assignment"
+    );
+    assert_eq!(
+        list.list_insert(2, Value::Nil),
+        Err(Error::IndexOutOfBounds { index: 2, len: 1 })
+    );
+    assert_eq!(
+        list.list_remove(5),
+        Err(Error::IndexOutOfBounds { index: 5, len: 1 })
+    );
+    assert_eq!(
+        list.list_len().unwrap(),
+        1,
+        "a rejected write must not mutate"
+    );
+    assert_eq!(list.list_get(0).unwrap().as_int(), Some(1));
+}
+
+#[test]
+fn map_mutators_cover_the_table_operations() {
+    let map = Value::map_from([("a", Value::int(1))]);
+
+    assert!(map.map_contains(&Value::str("a")).unwrap());
+    assert!(!map.map_contains(&Value::str("b")).unwrap());
+    assert_eq!(map.map_get_str("a").unwrap().as_int(), Some(1));
+    assert_eq!(map.map_get_str("b"), Err(Error::KeyNotFound));
+
+    map.map_try_insert(Value::str("b"), Value::int(2)).unwrap();
+    assert_eq!(
+        map.map_try_insert(Value::str("b"), Value::int(3)),
+        Err(Error::DuplicateKey)
+    );
+    assert_eq!(
+        map.map_get_str("b").unwrap().as_int(),
+        Some(2),
+        "a refused insert must not write"
+    );
+    assert_eq!(map.map_len().unwrap(), 2);
+
+    assert_eq!(
+        map.map_keys().unwrap(),
+        vec![Value::str("a"), Value::str("b")]
+    );
+
+    map.map_clear().unwrap();
+    assert_eq!(map.map_len().unwrap(), 0);
+    assert_eq!(map.map_keys().unwrap(), Vec::<Value>::new());
+    assert!(!map.map_contains(&Value::str("a")).unwrap());
+}
+
+#[test]
+fn obj_helpers_expose_the_own_shape() {
+    let obj = Value::object_of_class("Point");
+    assert_eq!(obj.obj_class().unwrap().as_deref(), Some("Point"));
+    assert_eq!(Value::object().obj_class().unwrap(), None);
+
+    obj.obj_set("x", Value::int(1)).unwrap();
+    obj.obj_set("y", Value::int(2)).unwrap();
+    assert_eq!(
+        obj.obj_keys().unwrap(),
+        vec!["x".to_owned(), "y".to_owned()]
+    );
+    assert!(obj.obj_has_own("x").unwrap());
+    assert!(!obj.obj_has_own("z").unwrap());
+}
+
+#[test]
+fn mutators_report_the_wrong_shape_with_the_operation_that_failed() {
+    let not_a_list = Value::int(1);
+    let not_a_map = Value::str("x");
+    let not_an_object = Value::float(1.0);
+
+    let cases: Vec<(&str, &'static str, &'static str, Error)> = vec![
+        (
+            "list_set",
+            "Value::with_list",
+            "list",
+            not_a_list.list_set(0, Value::Nil).unwrap_err(),
+        ),
+        (
+            "list_insert",
+            "Value::with_list",
+            "list",
+            not_a_list.list_insert(0, Value::Nil).unwrap_err(),
+        ),
+        (
+            "list_remove",
+            "Value::with_list",
+            "list",
+            not_a_list.list_remove(0).unwrap_err(),
+        ),
+        (
+            "list_iter",
+            "Value::with_list_ref",
+            "list",
+            not_a_list.list_iter().unwrap_err(),
+        ),
+        (
+            "list_clear",
+            "Value::with_list",
+            "list",
+            not_a_list.list_clear().unwrap_err(),
+        ),
+        (
+            "map_contains",
+            "Value::with_map_ref",
+            "map",
+            not_a_map.map_contains(&Value::int(0)).unwrap_err(),
+        ),
+        (
+            "map_get_str",
+            "Value::with_map_ref",
+            "map",
+            not_a_map.map_get_str("k").unwrap_err(),
+        ),
+        (
+            "map_try_insert",
+            "Value::with_map",
+            "map",
+            not_a_map
+                .map_try_insert(Value::int(0), Value::Nil)
+                .unwrap_err(),
+        ),
+        (
+            "map_keys",
+            "Value::with_map_ref",
+            "map",
+            not_a_map.map_keys().unwrap_err(),
+        ),
+        (
+            "map_clear",
+            "Value::with_map",
+            "map",
+            not_a_map.map_clear().unwrap_err(),
+        ),
+        (
+            "obj_has_own",
+            "Value::with_object_ref",
+            "object",
+            not_an_object.obj_has_own("k").unwrap_err(),
+        ),
+        (
+            "obj_keys",
+            "Value::with_object_ref",
+            "object",
+            not_an_object.obj_keys().unwrap_err(),
+        ),
+        (
+            "obj_class",
+            "Value::with_object_ref",
+            "object",
+            not_an_object.obj_class().unwrap_err(),
+        ),
+    ];
+
+    for (name, context, expected, err) in cases {
+        match err {
+            Error::TypeMismatch {
+                context: c,
+                expected: e,
+                found,
+            } => {
+                assert_eq!(c, context, "{name}");
+                assert_eq!(e, expected, "{name}");
+                assert!(!found.is_empty(), "{name}");
+            }
+            other => panic!("{name} should report a TypeMismatch, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn mutators_report_a_borrow_conflict_rather_than_blocking() {
+    let list = Value::list();
+    list.with_list(|_| {
+        assert_eq!(list.list_iter(), Err(Error::BorrowConflict("a list")));
+        assert_eq!(list.list_clear(), Err(Error::BorrowConflict("a list")));
+        assert_eq!(
+            list.list_set(0, Value::Nil),
+            Err(Error::BorrowConflict("a list"))
+        );
+    })
+    .unwrap();
+
+    let obj = Value::object();
+    obj.with_object(|_| {
+        assert_eq!(obj.obj_keys(), Err(Error::BorrowConflict("an object")));
+        assert_eq!(obj.obj_class(), Err(Error::BorrowConflict("an object")));
+    })
+    .unwrap();
+    assert_eq!(obj.obj_class().unwrap(), None);
 }
 
 #[test]

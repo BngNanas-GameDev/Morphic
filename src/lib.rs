@@ -95,7 +95,7 @@
 //! [`serde_json::Value`]: https://crates.io/crates/serde_json
 
 #![doc(html_root_url = "https://docs.rs/morphic/0.1.0")]
-#![warn(missing_docs)]
+#![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod convert;
@@ -110,6 +110,6 @@ pub use convert::{FromValue, IntoValue, ValueUser};
 pub use error::{Error, Result};
 pub use registry::{Registry, RegistryError};
 pub use value::{
-    CALL_PROP, CallCtx, MAX_PRINT_DEPTH, MAX_PROTO_DEPTH, NativeFn, NativeFnBody, Object, Value,
-    ValueMap,
+    CALL_PROP, CallCtx, MAX_PRINT_DEPTH, MAX_PRINT_ENTRIES, MAX_PROTO_DEPTH, NativeFn,
+    NativeFnBody, Object, Value, ValueMap,
 };

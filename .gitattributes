@@ -1,0 +1,26 @@
+# Normalize to LF in the repository and in working copies.
+#
+# The repository is already LF-only (core.autocrlf=true normalizes on commit),
+# but without this file every fresh clone on Windows gets CRLF and diverges
+# from the CI runners.
+* text=auto eol=lf
+
+# Windows cannot run Unix executables, so never let text conversion touch them.
+*.sh text eol=lf
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Treat these as binary: never attempt line-ending conversion.
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.rlib binary
+*.wasm binary
+
+# Lockfiles and build metadata stay LF and are kept verbatim.
+Cargo.lock text eol=lf

@@ -1,0 +1,14 @@
+[package]
+name = "morphic"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+description = "Dynamism for Rust: a garbage-collected dynamic value type, object-safe callables for traits that are not dyn-compatible, and a runtime type registry."
+repository = "https://github.com/BngNanas-GameDev/Morphic"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["gc", "garbage-collection", "dynamic", "dyn", "value", "interop"]
+categories = ["memory-management", "data-structures", "rust-patterns", "api-bindings"]
+
+[dependencies]
+boa_gc = "0.22"

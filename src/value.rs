@@ -25,14 +25,41 @@ use crate::error::{Error, Result};
 /// Cyclic graphs are legal, so any unbounded structural printer would hang.
 pub const MAX_PRINT_DEPTH: usize = 64;
 
+/// Maximum number of prototype links [`Object::get`], [`Object::has`],
+/// [`Object::chain_len`] and [`Value::as_callable`] will follow before giving
+/// up with [`Error::ProtoCycle`].
+///
+/// Prototype links are writable, so a cycle is constructible from safe code in
+/// two calls. Without this bound, `a.obj_set_proto(&b); b.obj_set_proto(&a)`
+/// followed by any property read spins forever at constant memory, which no
+/// allocator-based watchdog can detect.
+pub const MAX_PROTO_DEPTH: usize = 64;
+
 /// Per-call state threaded through nested dynamic calls.
 ///
 /// Carries the recursion depth so a cycle in the function graph produces an
 /// [`Error::RecursionLimit`] instead of a native stack overflow.
+///
+/// # The depth counter is per-thread, not per-context
+///
+/// The counter lives in a thread-local, not in this struct, and that is
+/// deliberate. An earlier design kept the depth in `CallCtx` and removed
+/// `Value::call` so that every nested call had to share one context — but a
+/// body can always construct a fresh `CallCtx::new()` and pass that down
+/// instead, which silently resets the budget. That version overflowed the stack
+/// in exactly the case the limit exists to prevent.
+///
+/// A thread-local cannot be reset by re-entering from inside a body, so the
+/// limit holds no matter how the contexts are threaded. The trade-off is that
+/// two `CallCtx`s on the same thread share one budget, and the smaller
+/// `max_depth` wins at the point of entry.
 #[derive(Debug, Clone)]
 pub struct CallCtx {
-    depth: u32,
     max_depth: u32,
+}
+
+thread_local! {
+    static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 impl Default for CallCtx {
@@ -52,10 +79,7 @@ impl CallCtx {
 
     /// A fresh context that allows `max_depth` nested calls.
     pub fn with_max_depth(max_depth: u32) -> Self {
-        Self {
-            depth: 0,
-            max_depth,
-        }
+        Self { max_depth }
     }
 
     /// The configured recursion limit.
@@ -63,42 +87,65 @@ impl CallCtx {
         self.max_depth
     }
 
-    /// The current nesting depth.
+    /// The current nesting depth on this thread.
     pub fn depth(&self) -> u32 {
-        self.depth
+        DEPTH.with(std::cell::Cell::get)
     }
 
-    pub(crate) fn enter(&mut self) -> Result<()> {
-        if self.depth >= self.max_depth {
-            return Err(Error::RecursionLimit {
-                limit: self.max_depth,
-            });
-        }
-        self.depth += 1;
-        Ok(())
+    /// Enter one call level, returning a guard that leaves it on drop.
+    pub(crate) fn enter(&self) -> Result<DepthGuard> {
+        DEPTH.with(|depth| {
+            let current = depth.get();
+            if current >= self.max_depth {
+                return Err(Error::RecursionLimit {
+                    limit: self.max_depth,
+                });
+            }
+            depth.set(current + 1);
+            Ok(DepthGuard)
+        })
     }
+}
 
-    pub(crate) fn leave(&mut self) {
-        self.depth -= 1;
+/// Decrements the thread's call depth on drop, so an unwind through a panicking
+/// body cannot leave the counter permanently raised and turn every later call
+/// into a spurious [`Error::RecursionLimit`].
+pub(crate) struct DepthGuard;
+
+impl Drop for DepthGuard {
+    fn drop(&mut self) {
+        DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
     }
 }
 
 /// The signature every [`NativeFn`] body must have.
-pub type NativeFnBody = Rc<dyn Fn(&mut CallCtx, &[Value]) -> Result<Value>>;
+pub type NativeFnBody = Rc<dyn Fn(&CallCtx, &[Value]) -> Result<Value>>;
 
 /// A callable Rust closure that lives in the garbage-collected heap.
 ///
-/// # The capture list is not optional
+/// # A body may hold `Gc` cells, and that leaks
 ///
-/// A [`Value::User`] payload is a bare [`GcErased`], and a closure body is an
-/// opaque `Rc<dyn Fn ..>`. Neither can be introspected to discover which `Gc`
-/// cells it holds, so a closure that captures a `Gc` and does not register it
-/// would be collected while still reachable, and the collector would free a
-/// live cell. That is a use-after-free, not a leak.
+/// A body is an opaque `Rc<dyn Fn ..>`, so the collector cannot walk into it.
+/// A [`Value::User`] payload is a bare [`GcErased`], and the two are equally
+/// opaque. Neither can be introspected to discover which cells it holds.
 ///
-/// [`NativeFn::capture`] closes that hole: the `captures` list is the *only*
-/// part of this type the collector walks, so every `Gc` a body can reach must
-/// be named there. Bodies must be side-effect free with respect to rooting.
+/// The consequence is not the one you might expect. `boa_gc` 0.22 is not a
+/// pure tracer: `GcHeader::is_rooted` is `non_root_count < ref_count`, and
+/// `Trace::trace_non_roots` is what raises `non_root_count`. A `Gc` handle
+/// living in ordinary Rust memory — a closure environment, a stack slot — is
+/// therefore never marked non-root, so it is a **permanent root**. A cell
+/// captured by a body cannot be freed while the body is alive.
+///
+/// That makes this sound, and it also makes it leak: when the `NativeFn` is
+/// swept, its `Rc<dyn Fn ..>` is dropped under a guard, and `Gc::drop` only
+/// runs `Finalize` when `finalizer_safe()`. The refcount is never decremented,
+/// so the captured cell stays rooted forever.
+///
+/// In short: **a `Gc` captured by a body is safe but never reclaimed.** This is
+/// a property of `boa_gc`'s refcount model, not of the [`Trace`] contract, and
+/// it may change in a future `boa_gc`. If you need captured cells actually
+/// collected, use [`gc-arena`](https://crates.io/crates/gc-arena), whose
+/// mutation-XOR-collection design has no rooting problem at all.
 ///
 /// # Examples
 ///
@@ -118,19 +165,17 @@ pub type NativeFnBody = Rc<dyn Fn(&mut CallCtx, &[Value]) -> Result<Value>>;
 pub struct NativeFn {
     name: Gc<String>,
     body: NativeFnBody,
-    captures: Vec<GcErased>,
 }
 
 impl Finalize for NativeFn {}
 
 unsafe impl Trace for NativeFn {
-    // SAFETY: `captures` holds every `Gc` the body can reach. The opaque
-    // `body` closure is deliberately *not* traced, which is sound only because
-    // the constructor API forces captures to be registered here.
+    // SAFETY: only `name` can hold a `Gc`, and it is traced. The opaque `body`
+    // is deliberately not traced. That is sound because `boa_gc` 0.22 roots by
+    // reference count, so a `Gc` in the body stays rooted regardless; see the
+    // type-level docs for why that is also why captured cells leak.
     boa_gc::custom_trace!(this, mark, {
-        for capture in &this.captures {
-            mark(capture);
-        }
+        mark(&this.name);
     });
 }
 
@@ -138,7 +183,6 @@ impl fmt::Debug for NativeFn {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("NativeFn")
             .field("name", &self.name)
-            .field("captures", &self.captures.len())
             .finish()
     }
 }
@@ -146,47 +190,32 @@ impl fmt::Debug for NativeFn {
 impl NativeFn {
     /// Wrap `body` as a named native function.
     ///
-    /// Any `Gc` reachable from `body` **must** be registered with
-    /// [`NativeFn::capture`], [`NativeFn::capture_erased`], or
-    /// [`NativeFn::from_user`].
+    /// `body` may capture `Gc` cells. Doing so is sound but leaks them once this
+    /// `NativeFn` is collected; see the type-level docs for the mechanism.
     pub fn new<F>(name: &str, body: F) -> Self
     where
-        F: Fn(&mut CallCtx, &[Value]) -> Result<Value> + 'static,
+        F: Fn(&CallCtx, &[Value]) -> Result<Value> + 'static,
     {
         Self {
             name: Gc::new(name.to_owned()),
             body: Rc::new(body),
-            captures: Vec::new(),
         }
-    }
-
-    /// Attach a typed `Gc` to the collector-visible capture set.
-    pub fn capture<T: Trace + 'static>(mut self, cell: Gc<T>) -> Self {
-        self.captures.push(GcErased::new(cell));
-        self
-    }
-
-    /// Attach an already-erased `Gc` to the collector-visible capture set.
-    pub fn capture_erased(mut self, cell: GcErased) -> Self {
-        self.captures.push(cell);
-        self
     }
 
     /// Build a native function that receives `target` as its `self`.
     ///
-    /// This is the sound way to give a [`Value::User`] payload behaviour: the
-    /// data cell is captured *and* registered in one step, so the two can never
-    /// drift apart.
+    /// This is the ergonomic way to give a [`Value::User`] payload behaviour:
+    /// the data cell is moved into the body in one step, so it cannot be
+    /// forgotten.
     ///
     /// The body gets shared access. Use [`NativeFn::from_user_mut`] when it
     /// needs to mutate.
     pub fn from_user<T, F>(name: &str, target: Gc<T>, body: F) -> Self
     where
         T: Trace + 'static,
-        F: Fn(&T, &mut CallCtx, &[Value]) -> Result<Value> + 'static,
+        F: Fn(&T, &CallCtx, &[Value]) -> Result<Value> + 'static,
     {
-        let handle = target.clone();
-        Self::new(name, move |ctx, args| body(&handle, ctx, args)).capture(target)
+        Self::new(name, move |ctx, args| body(&target, ctx, args))
     }
 
     /// Build a native function that receives a mutable borrow of `target`.
@@ -196,35 +225,14 @@ impl NativeFn {
     pub fn from_user_mut<T, F>(name: &str, target: Gc<GcRefCell<T>>, body: F) -> Self
     where
         T: Trace + 'static,
-        F: Fn(GcRefMut<'_, T>, &mut CallCtx, &[Value]) -> Result<Value> + 'static,
+        F: Fn(GcRefMut<'_, T>, &CallCtx, &[Value]) -> Result<Value> + 'static,
     {
-        let handle = target.clone();
         Self::new(name, move |ctx, args| {
-            let borrowed = handle
+            let borrowed = target
                 .try_borrow_mut()
                 .map_err(|_| Error::BorrowConflict("a captured user cell"))?;
             body(borrowed, ctx, args)
         })
-        .capture(target)
-    }
-
-    /// Store an extra [`Value`] in the collector-visible capture set.
-    ///
-    /// The common case. The value is boxed into a fresh `Gc`, whose own
-    /// `Trace` impl walks whatever heap cells the value already holds, so this
-    /// is exactly as precise as capturing the underlying `Gc<T>` by hand.
-    pub fn capture_value(self, value: Value) -> Self {
-        self.capture(Gc::new(value))
-    }
-
-    /// Store an extra value in the collector-visible capture set.
-    ///
-    /// Useful for pinning non-`Gc` state that the body needs to outlive a
-    /// collection, without giving the closure itself a reason to capture a
-    /// `Gc` behind the collector's back.
-    pub fn with_arg<T: Trace + 'static>(mut self, arg: T) -> Self {
-        self.captures.push(GcErased::new(Gc::new(arg)));
-        self
     }
 
     /// The function's name.
@@ -232,16 +240,11 @@ impl NativeFn {
         self.name.as_str()
     }
 
-    /// How many cells are registered in the capture set.
-    pub fn capture_count(&self) -> usize {
-        self.captures.len()
-    }
-
     /// Invoke the body.
     ///
     /// The caller is responsible for depth accounting; [`Value::call_with`]
     /// does that for you.
-    pub fn call(&self, ctx: &mut CallCtx, args: &[Value]) -> Result<Value> {
+    pub fn call(&self, ctx: &CallCtx, args: &[Value]) -> Result<Value> {
         (self.body)(ctx, args)
     }
 }
@@ -405,26 +408,45 @@ impl Object {
     /// Returns a clone rather than a reference: the property may live on a
     /// prototype in a different cell, and holding a borrow of that cell while
     /// handing out a `&Value` into it would be unsound.
-    pub fn get(&self, key: &str) -> Option<Value> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::BorrowConflict`] if any object on the chain is
+    /// currently mutably borrowed, and [`Error::ProtoCycle`] if the chain is
+    /// longer than [`MAX_PROTO_DEPTH`] or loops. The cycle bound is essential:
+    /// prototype links are writable, so `a.obj_set_proto(&b)` followed by
+    /// `b.obj_set_proto(&a)` is legal and would otherwise loop forever.
+    pub fn get(&self, key: &str) -> Result<Option<Value>> {
         if let Some(v) = self.props.get_str(key) {
-            return Some(v.clone());
+            return Ok(Some(v.clone()));
         }
+        self.walk(key).map(Some)
+    }
+
+    /// Walk the prototype chain looking for `key`.
+    fn walk(&self, key: &str) -> Result<Value> {
         let mut cur = self.proto.clone();
+        let mut steps = 0usize;
         while let Some(cell) = cur {
-            let (hit, next) = {
-                let borrowed = cell.try_borrow().ok()?;
-                (borrowed.props.get_str(key).cloned(), borrowed.proto())
-            };
-            if let Some(v) = hit {
-                return Some(v);
+            steps += 1;
+            if steps > MAX_PROTO_DEPTH {
+                return Err(Error::ProtoCycle {
+                    limit: MAX_PROTO_DEPTH,
+                });
             }
-            cur = next;
+            let borrowed = cell
+                .try_borrow()
+                .map_err(|_| Error::BorrowConflict("a prototype"))?;
+            if let Some(v) = borrowed.props.get_str(key) {
+                return Ok(v.clone());
+            }
+            cur = borrowed.proto();
         }
-        None
+        Err(Error::KeyNotFound)
     }
 
     /// Look up a property anywhere on the prototype chain.
-    pub fn lookup(&self, key: &str) -> Option<Value> {
+    pub fn lookup(&self, key: &str) -> Result<Option<Value>> {
         self.get(key)
     }
 
@@ -441,8 +463,14 @@ impl Object {
     }
 
     /// Whether a property is reachable, including through the prototype chain.
-    pub fn has(&self, key: &str) -> bool {
-        self.get(key).is_some()
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`Error::BorrowConflict`] and [`Error::ProtoCycle`] from
+    /// [`Object::get`], so a temporarily unreadable prototype is never reported
+    /// as "absent".
+    pub fn has(&self, key: &str) -> Result<bool> {
+        self.get(key).map(|v| v.is_some())
     }
     /// Number of own properties, excluding the prototype chain.
     pub fn len(&self) -> usize {
@@ -473,14 +501,27 @@ impl Object {
     }
 
     /// Number of objects in the prototype chain, including this one.
-    pub fn chain_len(&self) -> usize {
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ProtoCycle`] if the chain loops, and [`Error::BorrowConflict`]
+    /// if a link cannot be read. It never reports a short count.
+    pub fn chain_len(&self) -> Result<usize> {
         let mut n = 1;
         let mut cur = self.proto.clone();
         while let Some(cell) = cur {
+            if n > MAX_PROTO_DEPTH {
+                return Err(Error::ProtoCycle {
+                    limit: MAX_PROTO_DEPTH,
+                });
+            }
             n += 1;
-            cur = cell.try_borrow().ok().and_then(|b| b.proto());
+            cur = cell
+                .try_borrow()
+                .map_err(|_| Error::BorrowConflict("a prototype"))?
+                .proto();
         }
-        n
+        Ok(n)
     }
 }
 
@@ -494,7 +535,7 @@ impl fmt::Debug for Object {
 }
 
 /// The property name an object must expose to be callable via
-/// [`Value::call`].
+/// [`Value::call_with`].
 pub const CALL_PROP: &str = "__call__";
 
 /// A dynamically typed value whose heap parts are garbage collected.
@@ -691,11 +732,14 @@ impl Value {
     pub fn is_callable(&self) -> bool {
         match self {
             Value::Native(_) => true,
-            Value::Object(o) => o.borrow().get(CALL_PROP).is_some_and(|v| v.is_callable()),
+            Value::Object(o) => o
+                .try_borrow()
+                .ok()
+                .and_then(|b| b.get(CALL_PROP).ok().flatten())
+                .is_some_and(|v| v.is_callable()),
             _ => false,
         }
     }
-
     /// Whether two values are the same heap cell.
     ///
     /// Meaningful for `List`, `Map`, `Object`, `Native` and `User`, where
@@ -818,18 +862,35 @@ impl Value {
     }
 
     /// Borrow the native function behind an object, via the prototype chain.
-    pub fn as_callable(&self) -> Option<Gc<NativeFn>> {
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`Error::BorrowConflict`] and [`Error::ProtoCycle`] rather
+    /// than reporting a callable object as non-callable.
+    pub fn as_callable(&self) -> Result<Gc<NativeFn>> {
         match self {
-            Value::Native(f) => Some(f.clone()),
+            Value::Native(f) => Ok(f.clone()),
             Value::Object(o) => {
-                let borrowed = o.try_borrow().ok()?;
-                let found = borrowed.get(CALL_PROP);
-                match &found {
+                let borrowed = o
+                    .try_borrow()
+                    .map_err(|_| Error::BorrowConflict("an object"))?;
+                let found = match borrowed.get(CALL_PROP) {
+                    Ok(found) => found,
+                    // No `__call__` anywhere on the chain means "not callable",
+                    // not "the key is missing". `BorrowConflict` and
+                    // `ProtoCycle` still propagate.
+                    Err(Error::KeyNotFound) => return Err(Error::NotCallable),
+                    Err(other) => return Err(other),
+                };
+                // `Value` has a `Drop` impl (the derive adds one), so a partial
+                // move out of it is not allowed. Borrow instead of destructuring.
+                let native = match &found {
                     Some(Value::Native(f)) => Some(f.clone()),
                     _ => None,
-                }
+                };
+                native.ok_or(Error::NotCallable)
             }
-            _ => None,
+            _ => Err(Error::NotCallable),
         }
     }
 
@@ -972,18 +1033,26 @@ impl Value {
     }
 
     /// Read an object property, following the prototype chain.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::KeyNotFound`] only when the walk completed and found nothing.
+    /// A temporarily unreadable prototype yields [`Error::BorrowConflict`], and
+    /// a looping chain yields [`Error::ProtoCycle`], rather than being
+    /// misreported as absence.
     pub fn obj_get(&self, key: &str) -> Result<Value> {
-        self.with_object_ref(|o| o.get(key).ok_or(Error::KeyNotFound))?
+        self.with_object_ref(|o| o.get(key))?
+            .and_then(|found| found.ok_or(Error::KeyNotFound))
     }
 
     /// Whether an object property is reachable through the prototype chain.
     pub fn obj_has(&self, key: &str) -> Result<bool> {
-        self.with_object_ref(|o| o.has(key))
+        self.with_object_ref(|o| o.has(key))?
     }
 
     /// An object value's prototype, as a shareable handle.
     pub fn proto(&self) -> Option<Gc<GcRefCell<Object>>> {
-        self.as_object()?.borrow().proto()
+        self.as_object()?.try_borrow().ok()?.proto()
     }
 
     /// Attach `proto`, which must be an object value, as this object's
@@ -1003,21 +1072,27 @@ impl Value {
         self.with_object(|o| o.remove(key))
     }
 
-    /// Call this value with a fresh [`CallCtx`].
-    pub fn call(&self, args: &[Value]) -> Result<Value> {
-        self.call_with(&mut CallCtx::new(), args)
-    }
-
     /// Call this value, threading an existing [`CallCtx`].
     ///
     /// Dispatches to a [`Value::Native`] body, or to an object's
-    /// [`CALL_PROP`] property. Anything else is [`Error::NotCallable`].
-    pub fn call_with(&self, ctx: &mut CallCtx, args: &[Value]) -> Result<Value> {
-        let callee = self.as_callable().ok_or(Error::NotCallable)?;
-        ctx.enter()?;
-        let out = callee.call(ctx, args);
-        ctx.leave();
-        out
+    /// [`CALL_PROP`] property, inherited or overridden. Anything else is
+    /// [`Error::NotCallable`].
+    ///
+    /// This is the only call entry point on purpose. An earlier `Value::call`
+    /// that built a fresh [`CallCtx`] per invocation was trivially bypassable:
+    /// a body re-entering through it got a depth counter of zero, so mutual
+    /// recursion overflowed the native stack instead of returning
+    /// [`Error::RecursionLimit`]. The counter only bounds recursion if every
+    /// nested call goes through the same context.
+    ///
+    /// # Panics
+    ///
+    /// Never. Borrow conflicts and recursion limits are reported as errors, and
+    /// the depth counter is unwound even if a body panics.
+    pub fn call_with(&self, ctx: &CallCtx, args: &[Value]) -> Result<Value> {
+        let callee = self.as_callable()?;
+        let _guard = ctx.enter()?;
+        callee.call(ctx, args)
     }
 }
 
@@ -1032,17 +1107,22 @@ impl PartialEq for Value {
             (Value::Bytes(a), Value::Bytes(b)) => a == b,
             (Value::Type(a), Value::Type(b)) => a == b,
             (Value::Float(a), Value::Float(b)) => a.to_bits() == b.to_bits(),
-            (Value::Int(a), Value::Float(b)) => (*a as f64) == *b,
-            (Value::Float(b), Value::Int(a)) => (*a as f64) == *b,
             (Value::List(a), Value::List(b)) => Gc::ptr_eq(a, b),
             (Value::Map(a), Value::Map(b)) => Gc::ptr_eq(a, b),
             (Value::Object(a), Value::Object(b)) => Gc::ptr_eq(a, b),
             (Value::Native(a), Value::Native(b)) => Gc::ptr_eq(a, b),
             (Value::User(a), Value::User(b)) => GcErased::ptr_eq(a, b),
+            // Int and Float are deliberately NOT cross-compared. Comparing them
+            // numerically is not transitive: Int(2^53+1) == Float(2^53) and
+            // Int(2^53) == Float(2^53) but the two Ints differ, so `ValueMap`
+            // would silently collapse three inserts into two and destroy a
+            // value. Use `Value::as_float`, which widens an Int on read.
             _ => false,
         }
     }
 }
+
+impl Eq for Value {}
 
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1111,8 +1191,9 @@ impl Value {
                         f.write_str(k)?;
                         f.write_str(": ")?;
                         match obj.get(k) {
-                            Some(v) => v.fmt_at(f, depth + 1)?,
-                            None => f.write_str("<missing>")?,
+                            Ok(Some(v)) => v.fmt_at(f, depth + 1)?,
+                            Ok(None) => f.write_str("<missing>")?,
+                            Err(_) => f.write_str("<unreadable>")?,
                         }
                     }
                     f.write_str("}")

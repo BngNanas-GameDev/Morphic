@@ -52,7 +52,7 @@
 //! A trait object cannot have a by-value `self` method that you can actually
 //! call. `Box<dyn Trait>` will not let you move the `dyn` out of the box, and
 //! by-value dispatch needs exactly that. This is why `Box<dyn FnOnce()>` does
-//! not exist in Rust â€” a language rule, not an oversight.
+//! not exist in Rust - a language rule, not an oversight.
 //!
 //! So [`DynFnOnce`] is useful on a concrete type and useless behind a `Box`,
 //! and there is deliberately no `boxed_fn_once`. For "call each handler at most
@@ -68,7 +68,7 @@
 //! `|| ..` compile:
 //!
 //! ```compile_fail
-//! # use morphiс::dyn_fn::boxed_fn;
+//! # use morphic::dyn_fn::boxed_fn;
 //! let f: Box<dyn morphic::dyn_fn::DynFn<(), u8> + Send + Sync> = boxed_fn(|| 1u8);
 //! ```
 //!

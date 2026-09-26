@@ -5,7 +5,7 @@
 //! object-safe callables for trait signatures Rust cannot put behind a `dyn`.
 //!
 //! ```
-//! use morphic::{FromValue, NativeFn, Value};
+//! use morphic::{CallCtx, FromValue, NativeFn, Value};
 //!
 //! // Any shape, chosen at runtime, collected when unreachable.
 //! let config = Value::map_from([
@@ -26,7 +26,15 @@
 //!     let b = i64::from_value(args.get(1).unwrap_or(&Value::Nil), "add")?;
 //!     Ok(Value::int(a + b))
 //! }));
-//! assert_eq!(add.call(&[Value::int(2), Value::int(3)]).unwrap().as_int(), Some(5));
+//! let ctx = CallCtx::new();
+//! assert_eq!(add.call_with(&ctx, &[Value::int(2), Value::int(3)]).unwrap().as_int(), Some(5));
+//!
+//! // A prototype cycle is rejected rather than followed forever.
+//! let a = Value::object();
+//! let b = Value::object();
+//! a.obj_set_proto(&b).unwrap();
+//! b.obj_set_proto(&a).unwrap();
+//! assert!(a.obj_get("anything").is_err());
 //! ```
 //!
 //! # Why this exists
@@ -39,16 +47,17 @@
 //!   concept of "directly on the stack", so nothing distinguishes a root from a
 //!   heap-held pointer. Every design below is a different answer to that one
 //!   question.
-//! * **The project has never accepted a GC RFC.** RFC 256 removed the
-//!   pre-1.0 `@T` refcounting collector in 2014, noting that "the majority of
-//!   the Rust core team still believe that there are use cases that would be
-//!   well handled by a proper tracing garbage collector". Eleven years later
-//!   there is still no proposal.
+//! * **The project has never accepted a GC RFC that adds one.** RFC 256 removed
+//!   the pre-1.0 `@T` refcounting collector in 2014, noting that "the majority
+//!   of the Rust core team still believe that there are use cases that would be
+//!   well handled by a proper tracing garbage collector". As of 2026 there is
+//!   still no proposal to add one.
 //!
 //! So the collector here is borrowed, not invented. `morphic` builds on
 //! [`boa_gc`], the mark-sweep collector behind the Boa JavaScript engine, which
-//! is the most widely deployed GC written in Rust. What is new here is the
-//! layer above it.
+//! is the most widely deployed GC written in Rust. Note that 0.22 is a
+//! **refcount hybrid**, not a pure tracer — see [`NativeFn`] for why that
+//! matters here. What is new is the layer above it.
 //!
 //! # What is new here
 //!
@@ -101,5 +110,6 @@ pub use convert::{FromValue, IntoValue, ValueUser};
 pub use error::{Error, Result};
 pub use registry::{Registry, RegistryError};
 pub use value::{
-    CALL_PROP, CallCtx, MAX_PRINT_DEPTH, NativeFn, NativeFnBody, Object, Value, ValueMap,
+    CALL_PROP, CallCtx, MAX_PRINT_DEPTH, MAX_PROTO_DEPTH, NativeFn, NativeFnBody, Object, Value,
+    ValueMap,
 };

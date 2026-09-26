@@ -32,8 +32,10 @@ impl Plugins {
         Self { handlers }
     }
 
-    fn enable<H: Send + Sync + 'static>(&mut self, h: H) {
-        self.handlers.insert(h);
+    /// Remove a handler. A disabled instruction is genuinely absent, which is
+    /// what `is_enabled` reports.
+    fn disable<H: Send + Sync + 'static>(&mut self) {
+        self.handlers.remove::<H>();
     }
 
     fn is_enabled<H: Send + Sync + 'static>(&self) -> bool {
@@ -95,15 +97,16 @@ fn run(plugins: &Plugins, name: &str, args: &Value) -> Result<i64, String> {
 
 fn main() {
     let mut plugins = Plugins::new();
-    println!("registered: {:?}", plugins.names());
+    println!("all registered:  {:?}", plugins.names());
 
-    // A disabled handler is simply absent from the registry.
-    plugins.enable(Dec);
-    let _ = Inc;
+    // A handler that is not in the registry simply is not there. `Dec` is
+    // removed, so the `dec` instruction below reports it as missing.
+    plugins.disable::<Dec>();
+    println!("after disable:   {:?}", plugins.names());
 
     let args = Value::list_from([Value::int(1), Value::int(2), Value::int(3)]);
     let program = Value::list_from(
-        ["inc", "dbl", "triple", "offset", "nope"]
+        ["inc", "dec", "dbl", "triple", "offset", "nope"]
             .iter()
             .map(|n| Value::str(n))
             .collect::<Vec<_>>(),
@@ -129,23 +132,24 @@ fn main() {
 
     println!("log: {args}");
 
-    // A native function stored in a `Value` and called later. The captured
-    // cell is what keeps the log alive across a collection.
-    let sum = Value::native(
-        NativeFn::new("sum", {
-            let log = args.clone();
-            move |_ctx, _a| {
-                let total = log
-                    .with_list_ref(|l| l.iter().filter_map(Value::as_int).sum::<i64>())
-                    .map_err(|e| morphic::Error::User(e.to_string()))?;
-                Ok(Value::int(total))
-            }
-        })
-        .capture_value(args.clone()),
-    );
+    // A native function stored in a `Value` and called later. The body moves
+    // the log in, which is what keeps it alive across a collection.
+    let sum = Value::native(NativeFn::new("sum", {
+        let log = args.clone();
+        move |_ctx, _a| {
+            let total = log
+                .with_list_ref(|l| l.iter().filter_map(Value::as_int).sum::<i64>())
+                .map_err(|e| morphic::Error::User(e.to_string()))?;
+            Ok(Value::int(total))
+        }
+    }));
+
+    // One context for the whole program. The recursion limit is per-thread, so
+    // sharing it is what makes the limit hold across nested calls.
+    let ctx = morphic::CallCtx::new();
 
     morphic::gc::collect();
-    println!("sum of the log: {}", sum.call(&[]).unwrap());
+    println!("sum of the log: {}", sum.call_with(&ctx, &[]).unwrap());
 
     // A user payload, mutated from a native function through a captured cell.
     let counter = Gc::new(GcRefCell::new(0i64));
@@ -158,7 +162,7 @@ fn main() {
         },
     ));
     for _ in 0..3 {
-        tick.call(&[]).unwrap();
+        tick.call_with(&ctx, &[]).unwrap();
     }
     println!("ticks: {}", counter.borrow());
 
@@ -186,6 +190,6 @@ fn main() {
         )
         .unwrap();
 
-    println!("inherited call: {}", base.call(&[]).unwrap());
-    println!("overridden call: {}", polite.call(&[]).unwrap());
+    println!("inherited call: {}", base.call_with(&ctx, &[]).unwrap());
+    println!("overridden call: {}", polite.call_with(&ctx, &[]).unwrap());
 }

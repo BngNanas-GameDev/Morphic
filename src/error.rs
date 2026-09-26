@@ -38,7 +38,16 @@ pub enum Error {
         len: usize,
     },
     /// A map or object did not contain the requested key.
+    ///
+    /// Only ever returned when the walk actually completed. A prototype that
+    /// could not be read reports [`Error::BorrowConflict`] instead.
     KeyNotFound,
+    /// A prototype chain exceeded [`MAX_PROTO_DEPTH`](crate::MAX_PROTO_DEPTH),
+    /// which means it loops.
+    ProtoCycle {
+        /// The configured limit.
+        limit: usize,
+    },
     /// A `GcRefCell` was already mutably borrowed, or already borrowed when a
     /// mutable borrow was attempted.
     BorrowConflict(&'static str),
@@ -74,6 +83,9 @@ impl fmt::Display for Error {
                 write!(f, "index {index} out of bounds for length {len}")
             }
             Error::KeyNotFound => f.write_str("key not found"),
+            Error::ProtoCycle { limit } => {
+                write!(f, "prototype chain exceeded {limit} links, so it must loop")
+            }
             Error::BorrowConflict(what) => write!(f, "borrow conflict while accessing {what}"),
             Error::RecursionLimit { limit } => {
                 write!(f, "call recursion limit of {limit} reached")

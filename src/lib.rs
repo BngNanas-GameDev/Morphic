@@ -63,7 +63,8 @@
 //!
 //! * **A closed-enum [`Value`] with a total equality.** No `dyn` is needed for
 //!   data, so every match stays exhaustive. Floats compare by bit pattern, so
-//!   `Value` can key a map without `Eq`/`Hash`, which is the friction that has
+//!   `Value` is a real `Eq` with a consistent [`Hash`](std::hash::Hash) and
+//!   can key an insertion-ordered hash-indexed map, which is the friction that has
 //!   kept the ecosystem from converging on a dynamic value type
 //!   ([`serde_json::Value`] owns, [`valuable`] borrows, and nothing has won).
 //! * **An explicit capture list for native functions.** See [`NativeFn`] for

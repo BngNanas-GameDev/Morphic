@@ -2,6 +2,9 @@ use morphic::{
     CALL_PROP, CallCtx, Error, Finalize, FromValue, Gc, GcRefCell, MAX_PRINT_ENTRIES,
     MAX_PROTO_DEPTH, NativeFn, Object, Trace, Value, ValueMap,
 };
+use std::any::TypeId;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 /// `Value::call` was deliberately removed from the public API: it built a fresh
 /// `CallCtx` per invocation, so a body re-entering through it reset the depth
@@ -1166,4 +1169,136 @@ fn type_values_round_trip() {
     assert_eq!(v.as_type_id(), Some(tid));
     assert_eq!(Value::int(0).as_type_id(), None);
     assert_eq!(Value::int(0).user_type_id(), None);
+}
+
+fn hash_of(v: &Value) -> u64 {
+    let mut h = DefaultHasher::new();
+    v.hash(&mut h);
+    h.finish()
+}
+
+fn assert_same_hash(a: &Value, b: &Value) {
+    assert_eq!(a, b);
+    assert_eq!(
+        hash_of(a),
+        hash_of(b),
+        "equal keys must hash equally or the index loses them"
+    );
+}
+
+#[test]
+fn value_hash_agrees_with_equality_on_every_shape() {
+    assert_same_hash(&Value::Nil, &Value::Nil);
+    assert_same_hash(&Value::bool(true), &Value::bool(true));
+    assert_same_hash(&Value::int(-7), &Value::int(-7));
+    assert_same_hash(&Value::char('z'), &Value::char('z'));
+    assert_same_hash(&Value::float(1.5), &Value::float(1.5));
+    assert_same_hash(
+        &Value::type_id(TypeId::of::<u32>()),
+        &Value::type_id(TypeId::of::<u32>()),
+    );
+
+    let nan_a = Value::float(f64::NAN);
+    let nan_b = Value::float(f64::NAN);
+    assert_same_hash(&nan_a, &nan_b);
+    assert_same_hash(&nan_a, &nan_a.clone());
+
+    assert_ne!(Value::float(0.0), Value::float(-0.0));
+    assert_ne!(Value::int(1), Value::float(1.0));
+    assert_ne!(Value::int(0), Value::bool(false));
+
+    assert_same_hash(&Value::str("same"), &Value::str("same"));
+    assert_same_hash(
+        &Value::bytes(vec![1u8, 2, 3]),
+        &Value::bytes(vec![1u8, 2, 3]),
+    );
+
+    let list = Value::list();
+    assert_same_hash(&list, &list.clone());
+    let map = Value::map();
+    assert_same_hash(&map, &map.clone());
+    let obj = Value::object();
+    assert_same_hash(&obj, &obj.clone());
+    let native = Value::native(NativeFn::new("f", |_ctx, _args| Ok(Value::Nil)));
+    assert_same_hash(&native, &native.clone());
+
+    let distinct_lists = (
+        Value::list_from([Value::int(1)]),
+        Value::list_from([Value::int(1)]),
+    );
+    assert_ne!(distinct_lists.0, distinct_lists.1);
+
+    #[derive(Trace, Finalize)]
+    struct Tag(i64);
+
+    let user = Value::user(Tag(1));
+    assert_same_hash(&user, &user.clone());
+    let other_user = Value::user(Tag(1));
+    assert_ne!(user, other_user);
+    assert_eq!(
+        hash_of(&user),
+        hash_of(&other_user),
+        "same-type users share one hash by design; the collision is legal, merely slower"
+    );
+}
+
+#[test]
+fn map_remove_middle_repairs_the_moved_index_entry() {
+    let mut m = ValueMap::new();
+    m.insert(Value::str("a"), Value::int(1));
+    m.insert(Value::str("b"), Value::int(2));
+    m.insert(Value::str("c"), Value::int(3));
+
+    assert_eq!(
+        m.remove(&Value::str("b")).unwrap().as_int(),
+        Some(2),
+        "removal returns the removed value"
+    );
+    assert_eq!(m.len(), 2);
+    assert_eq!(
+        m.get(&Value::str("a")).unwrap().as_int(),
+        Some(1),
+        "the entry before the gap still resolves"
+    );
+    assert_eq!(
+        m.get(&Value::str("c")).unwrap().as_int(),
+        Some(3),
+        "the entry swapped into the gap still resolves"
+    );
+    assert!(!m.contains_key(&Value::str("b")));
+    assert_eq!(m.remove(&Value::str("b")), None);
+    let keys: Vec<_> = m.keys().filter_map(Value::as_str).collect();
+    assert_eq!(keys, vec!["a", "c"]);
+
+    m.insert(Value::str("d"), Value::int(4));
+    assert_eq!(m.len(), 3);
+    assert_eq!(m.get(&Value::str("d")).unwrap().as_int(), Some(4));
+    assert_eq!(m.get(&Value::str("c")).unwrap().as_int(), Some(3));
+
+    m.clear();
+    assert!(m.is_empty());
+    assert_eq!(m.len(), 0);
+    assert!(!m.contains_key(&Value::str("a")));
+    m.insert(Value::str("e"), Value::int(5));
+    assert_eq!(m.get(&Value::str("e")).unwrap().as_int(), Some(5));
+}
+
+#[test]
+fn map_replace_keeps_first_insertion_position() {
+    let mut m = ValueMap::new();
+    m.insert(Value::str("a"), Value::int(1));
+    m.insert(Value::str("b"), Value::int(2));
+    m.insert(Value::str("c"), Value::int(3));
+
+    assert_eq!(
+        m.insert(Value::str("b"), Value::int(20)).unwrap().as_int(),
+        Some(2),
+        "replacement returns the previous value"
+    );
+    assert_eq!(m.len(), 3);
+    let keys: Vec<_> = m.keys().filter_map(Value::as_str).collect();
+    assert_eq!(keys, vec!["a", "b", "c"]);
+    assert_eq!(m.get(&Value::str("b")).unwrap().as_int(), Some(20));
+    let values: Vec<_> = m.values().filter_map(Value::as_int).collect();
+    assert_eq!(values, vec![1, 20, 3]);
 }

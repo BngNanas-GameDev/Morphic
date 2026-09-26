@@ -12,7 +12,9 @@
 //! wants.
 
 use std::any::TypeId;
+use std::collections::HashMap;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 use boa_gc::{Finalize, Gc, GcErased, GcRefCell, GcRefMut, Trace};
@@ -260,18 +262,23 @@ impl NativeFn {
     }
 }
 
-/// An insertion-ordered association list from [`Value`] to [`Value`].
+/// An insertion-ordered map from [`Value`] to [`Value`] with O(1) lookup.
 ///
-/// A `Vec`-backed map rather than a `HashMap` for two reasons: keys keep a
-/// stable iteration order, and [`Value`] deliberately does not implement
-/// `Hash`, because a total, reflexive equality is what map keys need and
-/// hashing would force a choice this crate does not want to make.
+/// Indexmap-style storage: `entries` keeps insertion order so all iteration
+/// and display code is order-stable, while `index` maps each key to its
+/// position in `entries` for amortized O(1) insert and O(1) lookup and
+/// containment checks. Removal is O(1) via [`Vec::swap_remove`] plus fixing
+/// the moved entry's index; this reorders the tail element into the vacated
+/// slot rather than shifting, so iteration order after a removal is stable
+/// except for that one move.
 ///
-/// Lookup is linear. For a config or plugin table that is the right trade; it
-/// is not a database.
+/// [`Value`] deliberately hashes consistently with its [`PartialEq`]: equal
+/// keys always hash equally, so the index can never lose a key the linear
+/// scan would have found.
 #[derive(Clone, Default, Trace, Finalize)]
 pub struct ValueMap {
     entries: Vec<(Value, Value)>,
+    index: HashMap<Value, usize>,
 }
 
 impl ValueMap {
@@ -290,9 +297,10 @@ impl ValueMap {
         self.entries.is_empty()
     }
 
-    /// Look up `key`.
+    /// Look up `key` in amortized O(1) through the index.
     pub fn get(&self, key: &Value) -> Option<&Value> {
-        self.entries.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+        let pos = *self.index.get(key)?;
+        Some(&self.entries[pos].1)
     }
 
     /// Look up a string key.
@@ -300,36 +308,49 @@ impl ValueMap {
         self.get(&Value::str(key))
     }
 
-    /// Whether `key` is present.
+    /// Whether `key` is present, in O(1) through the index.
     pub fn contains_key(&self, key: &Value) -> bool {
-        self.entries.iter().any(|(k, _)| k == key)
+        self.index.contains_key(key)
     }
 
     /// Insert `value` under `key`, returning the previous value if any.
     ///
-    /// An existing key keeps its original position, so iteration order
-    /// reflects first-insertion, not last-write.
+    /// Amortized O(1). An existing key keeps its original position, so
+    /// iteration order reflects first-insertion, not last-write.
     pub fn insert(&mut self, key: Value, value: Value) -> Option<Value> {
-        if let Some(slot) = self.entries.iter_mut().find(|(k, _)| *k == key) {
-            return Some(core::mem::replace(&mut slot.1, value));
+        if let Some(&pos) = self.index.get(&key) {
+            return Some(core::mem::replace(&mut self.entries[pos].1, value));
         }
-        self.entries.push((key, value));
+        self.entries.push((key.clone(), value));
+        self.index.insert(key, self.entries.len() - 1);
         None
     }
 
     /// Insert, failing with [`Error::DuplicateKey`] if `key` is already present.
     pub fn try_insert(&mut self, key: Value, value: Value) -> Result<()> {
-        if self.contains_key(&key) {
+        if self.index.contains_key(&key) {
             return Err(Error::DuplicateKey);
         }
-        self.entries.push((key, value));
+        self.entries.push((key.clone(), value));
+        self.index.insert(key, self.entries.len() - 1);
         Ok(())
     }
 
     /// Remove `key`, returning its value.
+    ///
+    /// O(1): the entry is removed with [`Vec::swap_remove`] and the element
+    /// moved into the vacated slot has its index entry fixed to the new
+    /// position. The tail element therefore changes position; every other
+    /// entry keeps its order.
     pub fn remove(&mut self, key: &Value) -> Option<Value> {
-        let idx = self.entries.iter().position(|(k, _)| k == key)?;
-        Some(self.entries.remove(idx).1)
+        let pos = *self.index.get(key)?;
+        self.index.remove(key);
+        let (_, value) = self.entries.swap_remove(pos);
+        if pos < self.entries.len() {
+            let moved = self.entries[pos].0.clone();
+            self.index.insert(moved, pos);
+        }
+        Some(value)
     }
 
     /// Remove a string key, returning its value.
@@ -355,6 +376,7 @@ impl ValueMap {
     /// Drop all entries.
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.index.clear();
     }
 }
 
@@ -601,15 +623,19 @@ pub const CALL_PROP: &str = "__call__";
 /// [`ValueMap`]. Two consequences worth knowing:
 ///
 /// * Floats compare by bit pattern, so `NaN == NaN` holds and reflexivity is
-///   preserved. `Int`/`Float` pairs compare numerically, so `1` and `1.0` are
-///   the same key.
+///   preserved, while `0.0 != -0.0`. `Int` and `Float` are never equal across
+///   kinds, so `1` and `1.0` are distinct keys; use [`Value::as_float`], which
+///   widens an `Int` on read without making them equal.
 /// * `List`, `Map`, `Object`, `Native` and `User` compare by *identity*, not
 ///   structure. Structural equality on a cyclic graph is not decidable, so
 ///   structural comparison is deliberately not offered.
 ///
-/// Mixed `Int`/`Float` transitivity has the usual float wart:
-/// `Int(2^53 + 1) == Float(2^53)` while `Int(2^53 + 1) != Int(2^53)`. Do not
-/// rely on `Eq`-style transitivity across numeric kinds.
+/// [`Hash`] is consistent with that equality: equal keys always hash equally.
+/// Scalars hash by value, `Float` by [`f64::to_bits`], `Str` and `Bytes` by
+/// content, `Type` by [`TypeId`], the container and `Native` variants by the
+/// address of the underlying box, and `User` by its payload [`TypeId`].
+/// Same-type `User` values with distinct boxes therefore collide by design;
+/// that is legal, merely slower.
 #[derive(Clone, Trace, Finalize)]
 #[non_exhaustive]
 pub enum Value {
@@ -1327,6 +1353,40 @@ impl PartialEq for Value {
 }
 
 impl Eq for Value {}
+
+/// Hash consistent with [`PartialEq`]: `k1 == k2` implies `hash(k1) ==
+/// hash(k2)`.
+///
+/// The discriminant is hashed first so cross-kind pairs such as `Int(1)` and
+/// `Float(1.0)`, which are never equal, can never share a hash for the wrong
+/// reason. Within a kind, scalars hash by value, `Float` by [`f64::to_bits`]
+/// (matching bit-pattern equality, so every `NaN` bit pattern hashes with
+/// itself and `-0.0` differs from `0.0`), `Str` and `Bytes` by content,
+/// `Type` by [`TypeId`], `List`/`Map`/`Object`/`Native` by the address of the
+/// underlying box (matching identity equality: the same box implies the same
+/// address while any handle is live, and the map itself holds the key so the
+/// box cannot be freed out from under it), and `User` by its payload
+/// [`TypeId`] (collisions across same-type users are legal, merely slower).
+impl Hash for Value {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        core::mem::discriminant(self).hash(state);
+        match self {
+            Value::Nil => {}
+            Value::Bool(b) => b.hash(state),
+            Value::Int(i) => i.hash(state),
+            Value::Float(f) => f.to_bits().hash(state),
+            Value::Char(c) => c.hash(state),
+            Value::Str(s) => s.as_str().hash(state),
+            Value::Bytes(b) => b.as_slice().hash(state),
+            Value::Type(t) => t.hash(state),
+            Value::List(l) => std::ptr::from_ref(&**l).hash(state),
+            Value::Map(m) => std::ptr::from_ref(&**m).hash(state),
+            Value::Object(o) => std::ptr::from_ref(&**o).hash(state),
+            Value::Native(n) => std::ptr::from_ref(&**n).hash(state),
+            Value::User(u) => u.type_id().hash(state),
+        }
+    }
+}
 
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

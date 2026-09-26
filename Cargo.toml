@@ -12,3 +12,10 @@ categories = ["memory-management", "data-structures", "rust-patterns", "api-bind
 
 [dependencies]
 boa_gc = "0.22"
+
+[dev-dependencies]
+criterion = "0.8"
+
+[[bench]]
+name = "morphic"
+harness = false

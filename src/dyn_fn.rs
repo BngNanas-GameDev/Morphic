@@ -47,6 +47,14 @@
 //! macro. What this module removes is the need for an `async_trait` box on the
 //! value layer, and the need to name a `Future` type at every call site.
 //!
+//! # Cost floor of [`boxed_async_fn`]
+//!
+//! Erasing an async callable has a per-call floor that no honest
+//! implementation of this shape removes: invoking boxes the returned future
+//! onto the heap once per call, and polling then crosses two indirections,
+//! the [`DynFn::invoke`] vtable and the [`Future::poll`] vtable. The
+//! allocation and the double dispatch are what buy the erasure.
+//!
 //! # The one thing it cannot do
 //!
 //! A trait object cannot have a by-value `self` method that you can actually
@@ -153,6 +161,9 @@ where
 }
 
 /// Erase an `async fn`-shaped closure returning a [`BoxFuture`].
+///
+/// Per-call cost floor: one heap allocation for the returned future plus two
+/// indirect dispatches (`invoke`, then `poll`). See the module docs.
 pub fn boxed_async_fn<A, T, F, Fut>(f: F) -> Box<dyn DynFn<A, BoxFuture<'static, T>> + Send + Sync>
 where
     F: Fn(A) -> Fut + Send + Sync + 'static,

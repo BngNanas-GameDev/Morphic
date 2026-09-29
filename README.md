@@ -193,7 +193,7 @@ assert_eq!(v.as_user::<Point>().unwrap().x, 1.0);
 
 ## Status
 
-Early, and specific about what that means. **105 tests** (64 value, 12 registry, 10 dyn_fn, 12 convert, 7 doctests), `cargo clippy --all-targets -- -D warnings` clean, `cargo doc` clean under `-D warnings`.
+Early, and specific about what that means. **109 tests** (68 value, 12 registry, 10 dyn_fn, 12 convert, 7 doctests), `cargo clippy --all-targets -- -D warnings` clean, `cargo doc` clean under `-D warnings`.
 
 An adversarial audit found 14 bugs in 0.1.0, three of them critical. All critical and major ones are fixed, each with a regression test:
 
@@ -223,49 +223,59 @@ A second pass cleared the remaining minor tier, each with a test:
 
 `cargo bench` (criterion 0.8.2) compares each operation against the idiomatic
 alternative. Every axis where `morphic` loses is listed; that is the point.
+All numbers are means with the **system allocator**, which is what a library
+user actually gets unless they install one themselves.
 
-| Operation | `morphic` (mean) | Baseline (mean) | Ratio |
-|---|---|---|---|
-| `list_push` x10k | 292 us (`Value::list` + `list_push`) | 19.2 us (`Vec<u64>` push) | 15x slower (was ~~386 us / 18x~~) |
-| `ValueMap` lookup, 1k keys, reused key | 48.8 ns (`map_get`) | 19.6 ns (`HashMap<String, i64>`) | 2.5x slower (was ~~3.28 us / 158x~~) |
-| `ValueMap` lookup, 1k keys, via `map_get_str` | 225 ns (fresh key allocated per call) | 19.6 ns (`HashMap<String, i64>`) | 11x slower — the residual is key allocation, see below |
-| `ValueMap` build, 1k entries | 217 us (`map_insert` x1k) | 50.9 us (`HashMap` insert x1k) | 4.3x slower (was ~~1.06 ms / 22x~~) |
-| `obj_get` at proto depth 8 | 1.66 us | 215 ns (own property) | 7.7x slower (was ~~1.51 us / 183 ns / 8.3x~~) |
-| `Value::call_with`, trivial body | 16.3 ns | 3.9 ns (direct closure call) | 4.2x slower (was ~~16.2 ns / 4.0 ns / 4.1x~~) |
-| `Gc::new` x100 + `force_collect` | 25.8 us | 17.1 us (`Rc::new` x100 + drop) | 1.5x this run — jitters run to run, see below (was ~~16.9 us / 17.1 us~~) |
-| `boxed_async_fn` invoke + poll | 57.3 ns | 0.86 ns (enum dispatch, inlined) | 67x slower (was ~~114 ns / 1.4 ns / 82x~~ — old harness double-boxed, see below) |
+| Operation | `morphic` | Baseline | Ratio | Was |
+|---|---|---|---|---|
+| `list_extend` x10k | 108 us | 21.3 us (`Vec<u64>` push) | 5.1x slower | new |
+| `list_push` x10k, one at a time | 304 us | 21.3 us | 14x slower | ~~292 us / 15x~~ |
+| `ValueMap` lookup, 1k keys, reused key | 35.0 ns (`map_get`) | 20.4 ns (`HashMap<String, i64>`) | **1.7x slower** | ~~48.8 ns / 2.5x~~ |
+| `ValueMap` lookup, 1k keys, `map_get_str` | 205 ns (no allocation) | 20.4 ns | 10x slower | ~~225 ns / 11x~~ |
+| `ValueMap` build, 1k entries | 153 us (`map_insert` x1k) | 55.2 us | **2.8x slower** | ~~217 us / 4.3x~~ |
+| `obj_get` at proto depth 8 | 188 ns | 43.9 ns (own property) | **4.3x slower** | ~~1.66 us / 7.7x~~ |
+| `Value::call_with`, trivial body | 16.1 ns | 3.9 ns (direct closure call) | 4.1x slower | unchanged |
+| `Gc::new` x100 + `force_collect` | 21.5 us | 16.9 us (`Rc` x100 + drop) | 1.3x slower | ~~25.8 us / 1.5x~~ |
+| `boxed_async_fn` invoke + poll | 57.2 ns | 0.85 ns (enum, inlined) | 67x slower | unchanged |
 
 Machine: Intel i5-7500 (4C/4T @ 3.40 GHz), Windows 10 Pro 64-bit, rustc 1.94.0,
-criterion default sampling with 3 s measurement windows. Struck numbers are the
+criterion default sampling, 3 s measurement windows. Struck numbers are the
 pre-change means on the same machine, kept so the improvement is auditable.
 
-What the table means, without softening it:
+### What the table means, without softening it
 
-- Map lookup is no longer a scan. `ValueMap` is now indexmap-style storage
-  (`entries: Vec` for order plus `index: HashMap<Value, usize>`), with a
-  `Hash` on `Value` consistent with its total equality (floats by bit pattern,
-  strings/bytes by content, containers by box address, users by payload
-  `TypeId`). The reused-key row (2.5x) is the index itself. The `map_get_str`
-  row (11x) pays one `Gc::new` per call to build the lookup key — allocation,
-  not search — and the old bench paid it too; the scan was the other ~3.05 us.
-  The build axis (4.3x, was 22x) pins the now-amortized insert honestly.
-- `list_push` (15x) pays a `RefCell` borrow plus GC write-barrier traffic per
-  element, and its confidence interval is wide (203-500 us across samples)
-  because the collector's allocation heuristic fires mid-push. That jitter is
-  real behavior, not measurement noise.
-- The async axis dropped from 114 ns to 57.3 ns, and about half of that drop
-  is a fixed bench harness, not faster code: the old `block_on` helper wrapped
-  the already-boxed future in a second `Box::pin`, so every iteration paid two
-  allocations. The new harness polls the returned `BoxFuture` in place (and
-  stack-pins the enum baseline), so 57.3 ns is one heap future plus two
-  vtable dispatches (`invoke`, then `poll`). That remainder is the documented
-  floor in `dyn_fn`: it buys erasure, not speed, and no `unsafe` was added to
-  chase it — so there is nothing for Miri to verify.
-- The GC axis read parity on the previous run and 1.5x on this one (25.8 us vs
-  17.1 us). Neither run touches code this change modified; the collector's
-  allocation heuristic fires mid-bench the same way it does mid-`list_push`.
-  Do not read either number as "GC is free" — it is one small-graph data
-  point, and captured cells still leak (see above).
+**Where the wins came from.** Two changes did it. The index's hasher is now
+`foldhash` instead of the standard library's default `RandomState`, which is
+SipHash-1-3 — deliberately DoS-resistant and roughly 3-4x slower on the short
+integer and short-string keys a `ValueMap` is actually keyed by. And
+`ValueMap::get_str` / `contains_str` / `remove_str` now hash a borrowed `&str`
+directly through `hashbrown`'s `raw_entry`, instead of building a `Gc<String>`
+key per call; that required giving each `Value` variant a stable byte tag so a
+borrowed key can reproduce the hash of the owned value it stands for. The
+prototype-depth row improved for the same reason: each link in the chain was
+allocating a lookup key. `foldhash` is *minimally* DoS-resistant, which is the
+right trade for trusted in-process data and the wrong one for attacker-chosen
+keys; the hasher type is isolated in the `Index` alias if that ever changes.
+
+**`list_extend` over `list_push`.** 5.1x is still a loss against `Vec`, but it
+is 2.8x better than pushing one at a time, because the borrow flag is checked
+once instead of 10,000 times. Use it whenever the whole sequence is available.
+The one-at-a-time row keeps a wide confidence interval (203-500 us) because the
+collector's allocation heuristic fires mid-push; that jitter is real behaviour.
+
+**`call_with` and the async axis are at their floor.** `call_with` is a
+predicted indirect call plus a thread-local depth counter, against a baseline
+that inlines to almost nothing. The async row is one heap future plus two vtable
+dispatches. Those are the price of erasure, and no `unsafe` was added to reduce
+them.
+
+**Allocator.** Swapping the global allocator to `mimalloc` (bench-only, never
+in the library) moved several rows substantially on this machine: the async
+dispatch 57.2 -> 12.9 ns, `Gc::new` + collect 21.5 -> 4.2 us, `map_get_str`
+205 -> 86 ns, `list_push` ~304 -> ~201 us. Those are **not** the numbers above,
+because a user who installs `morphic` gets the system allocator unless they
+choose otherwise. The library deliberately does not set a global allocator,
+since that would be a decision imposed on every downstream binary.
 
 ## Licence
 

@@ -49,6 +49,13 @@ fn bench_list_push(c: &mut Criterion) {
             black_box(v.len())
         })
     });
+    group.bench_function("morphic_list_extend", |b| {
+        b.iter(|| {
+            let list = Value::list();
+            list.list_extend((0..10_000i64).map(Value::int)).unwrap();
+            black_box(list.list_len().unwrap())
+        })
+    });
     group.finish();
 }
 
@@ -83,6 +90,7 @@ fn bench_map_build(c: &mut Criterion) {
     group.bench_function("morphic_map", |b| {
         b.iter(|| {
             let map = Value::map();
+            map.with_map(|m| m.reserve(1000)).unwrap();
             for i in 0..1000i64 {
                 map.map_insert(Value::int(black_box(i)), Value::int(i))
                     .unwrap();

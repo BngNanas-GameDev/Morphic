@@ -12,9 +12,8 @@
 //! wants.
 
 use std::any::TypeId;
-use std::collections::HashMap;
 use std::fmt;
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::rc::Rc;
 
 use boa_gc::{Finalize, Gc, GcErased, GcRefCell, GcRefMut, Trace};
@@ -278,13 +277,40 @@ impl NativeFn {
 #[derive(Clone, Default, Trace, Finalize)]
 pub struct ValueMap {
     entries: Vec<(Value, Value)>,
-    index: HashMap<Value, usize>,
+    index: Index,
 }
+
+/// The index's hasher. `foldhash` is roughly 3-4x faster than the standard
+/// library's default `RandomState` (SipHash-1-3) on the short integer and
+/// short-string keys a `ValueMap` is realistically keyed by. It is *minimally*
+/// DoS-resistant: the right trade for a container fed by trusted in-process
+/// data. If a `ValueMap` is ever populated from an untrusted source where an
+/// attacker chooses the keys, this should become a keyed hasher.
+type Index = hashbrown::HashMap<Value, usize, foldhash::fast::FixedState>;
 
 impl ValueMap {
     /// An empty map.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// An empty map with room for `capacity` entries reserved in both the
+    /// entry vector and the index.
+    ///
+    /// Building a map one [`ValueMap::insert`] at a time from empty rehashes
+    /// the index repeatedly. Reserving up front turns that into a single
+    /// allocation.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            entries: Vec::with_capacity(capacity),
+            index: Index::with_capacity_and_hasher(capacity, foldhash::fast::FixedState::default()),
+        }
+    }
+
+    /// Reserve room for `additional` more entries without reallocating.
+    pub fn reserve(&mut self, additional: usize) {
+        self.entries.reserve(additional);
+        self.index.reserve(additional);
     }
 
     /// Number of entries.
@@ -303,9 +329,20 @@ impl ValueMap {
         Some(&self.entries[pos].1)
     }
 
-    /// Look up a string key.
+    /// Look up a string key in amortized O(1), allocating nothing.
+    ///
+    /// This is the hot path for string-keyed maps. [`ValueMap::get`] with a
+    /// prebuilt [`Value::Str`] key is equivalent and useful when the same key
+    /// is looked up repeatedly, but building that key costs a `Gc` allocation
+    /// per call, which dominates the search.
     pub fn get_str(&self, key: &str) -> Option<&Value> {
-        self.get(&Value::str(key))
+        let state = foldhash::fast::FixedState::default();
+        let hash = state.hash_one(StrTag(key));
+        let (_, pos) = self
+            .index
+            .raw_entry()
+            .from_hash(hash, |stored| stored.as_str() == Some(key))?;
+        Some(&self.entries[*pos].1)
     }
 
     /// Whether `key` is present, in O(1) through the index.
@@ -313,17 +350,34 @@ impl ValueMap {
         self.index.contains_key(key)
     }
 
+    /// Whether a string key is present, in O(1) and allocating nothing.
+    pub fn contains_str(&self, key: &str) -> bool {
+        let state = foldhash::fast::FixedState::default();
+        let hash = state.hash_one(StrTag(key));
+        self.index
+            .raw_entry()
+            .from_hash(hash, |stored| stored.as_str() == Some(key))
+            .is_some()
+    }
+
     /// Insert `value` under `key`, returning the previous value if any.
     ///
-    /// Amortized O(1). An existing key keeps its original position, so
-    /// iteration order reflects first-insertion, not last-write.
+    /// Amortized O(1) on a single hash: the index is probed once, and a miss
+    /// claims a slot instead of re-probing. An existing key keeps its original
+    /// position, so iteration order reflects first-insertion, not last-write.
     pub fn insert(&mut self, key: Value, value: Value) -> Option<Value> {
-        if let Some(&pos) = self.index.get(&key) {
-            return Some(core::mem::replace(&mut self.entries[pos].1, value));
+        match self.index.entry(key) {
+            hashbrown::hash_map::Entry::Occupied(slot) => {
+                let pos = *slot.get();
+                Some(core::mem::replace(&mut self.entries[pos].1, value))
+            }
+            hashbrown::hash_map::Entry::Vacant(slot) => {
+                let pos = self.entries.len();
+                self.entries.push((slot.key().clone(), value));
+                slot.insert(pos);
+                None
+            }
         }
-        self.entries.push((key.clone(), value));
-        self.index.insert(key, self.entries.len() - 1);
-        None
     }
 
     /// Insert, failing with [`Error::DuplicateKey`] if `key` is already present.
@@ -344,18 +398,30 @@ impl ValueMap {
     /// entry keeps its order.
     pub fn remove(&mut self, key: &Value) -> Option<Value> {
         let pos = *self.index.get(key)?;
-        self.index.remove(key);
+        Some(self.take_at(pos))
+    }
+
+    /// Remove a string key, returning its value, allocating nothing.
+    pub fn remove_str(&mut self, key: &str) -> Option<Value> {
+        let state = foldhash::fast::FixedState::default();
+        let hash = state.hash_one(StrTag(key));
+        let (_, pos) = self
+            .index
+            .raw_entry()
+            .from_hash(hash, |stored| stored.as_str() == Some(key))?;
+        Some(self.take_at(*pos))
+    }
+
+    /// Take the value at `pos` out of the entry vector, repairing the index.
+    fn take_at(&mut self, pos: usize) -> Value {
+        let key = self.entries[pos].0.clone();
+        self.index.remove(&key);
         let (_, value) = self.entries.swap_remove(pos);
         if pos < self.entries.len() {
             let moved = self.entries[pos].0.clone();
             self.index.insert(moved, pos);
         }
-        Some(value)
-    }
-
-    /// Remove a string key, returning its value.
-    pub fn remove_str(&mut self, key: &str) -> Option<Value> {
-        self.remove(&Value::str(key))
+        value
     }
 
     /// Iterate over entries in insertion order.
@@ -1076,6 +1142,15 @@ impl Value {
         })?
     }
 
+    /// Append `items` in one borrow.
+    ///
+    /// Cheaper than a [`Value::list_push`] per item: the borrow flag is
+    /// checked once instead of once per element. Prefer this when the whole
+    /// sequence is available up front.
+    pub fn list_extend<I: IntoIterator<Item = Value>>(&self, items: I) -> Result<()> {
+        self.with_list(|l| l.extend(items))
+    }
+
     /// Remove and return the last list element.
     ///
     /// # Error on an empty list
@@ -1354,37 +1429,105 @@ impl PartialEq for Value {
 
 impl Eq for Value {}
 
+/// Per-variant hash tags, so that a borrowed key can reproduce the hash of the
+/// owned value it stands for. They must never be reused across variants.
+const TAG_NIL: u8 = 0;
+const TAG_BOOL: u8 = 1;
+const TAG_INT: u8 = 2;
+const TAG_FLOAT: u8 = 3;
+const TAG_CHAR: u8 = 4;
+const TAG_STR: u8 = 5;
+const TAG_BYTES: u8 = 6;
+const TAG_LIST: u8 = 7;
+const TAG_MAP: u8 = 8;
+const TAG_OBJECT: u8 = 9;
+const TAG_NATIVE: u8 = 10;
+const TAG_USER: u8 = 11;
+const TAG_TYPE: u8 = 12;
+
 /// Hash consistent with [`PartialEq`]: `k1 == k2` implies `hash(k1) ==
 /// hash(k2)`.
 ///
-/// The discriminant is hashed first so cross-kind pairs such as `Int(1)` and
-/// `Float(1.0)`, which are never equal, can never share a hash for the wrong
-/// reason. Within a kind, scalars hash by value, `Float` by [`f64::to_bits`]
-/// (matching bit-pattern equality, so every `NaN` bit pattern hashes with
-/// itself and `-0.0` differs from `0.0`), `Str` and `Bytes` by content,
-/// `Type` by [`TypeId`], `List`/`Map`/`Object`/`Native` by the address of the
-/// underlying box (matching identity equality: the same box implies the same
-/// address while any handle is live, and the map itself holds the key so the
-/// box cannot be freed out from under it), and `User` by its payload
-/// [`TypeId`] (collisions across same-type users are legal, merely slower).
+/// Every variant is prefixed with a stable byte tag rather than
+/// `core::mem::discriminant`, so that a borrowed key can be hashed the same way
+/// as the owned value it stands for. That is what makes the zero-allocation
+/// `&str` probe in [`ValueMap::get_str`] sound: a private `StrTag` wrapper
+/// hashes as a `Value::Str` does, without needing the `Gc` allocation.
+///
+/// Within a kind, scalars hash by value, `Float` by [`f64::to_bits`] (matching
+/// bit-pattern equality, so every `NaN` bit pattern hashes with itself and
+/// `-0.0` differs from `0.0`), `Str` and `Bytes` by content, `Type` by
+/// [`TypeId`], `List`/`Map`/`Object`/`Native` by the address of the underlying
+/// box (matching identity equality: the same box implies the same address while
+/// any handle is live, and the map itself holds the key so the box cannot be
+/// freed out from under it), and `User` by its payload [`TypeId`] (collisions
+/// across same-type users are legal, merely slower).
 impl Hash for Value {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        core::mem::discriminant(self).hash(state);
         match self {
-            Value::Nil => {}
-            Value::Bool(b) => b.hash(state),
-            Value::Int(i) => i.hash(state),
-            Value::Float(f) => f.to_bits().hash(state),
-            Value::Char(c) => c.hash(state),
-            Value::Str(s) => s.as_str().hash(state),
-            Value::Bytes(b) => b.as_slice().hash(state),
-            Value::Type(t) => t.hash(state),
-            Value::List(l) => std::ptr::from_ref(&**l).hash(state),
-            Value::Map(m) => std::ptr::from_ref(&**m).hash(state),
-            Value::Object(o) => std::ptr::from_ref(&**o).hash(state),
-            Value::Native(n) => std::ptr::from_ref(&**n).hash(state),
-            Value::User(u) => u.type_id().hash(state),
+            Value::Nil => TAG_NIL.hash(state),
+            Value::Bool(b) => {
+                TAG_BOOL.hash(state);
+                b.hash(state);
+            }
+            Value::Int(i) => {
+                TAG_INT.hash(state);
+                i.hash(state);
+            }
+            Value::Float(f) => {
+                TAG_FLOAT.hash(state);
+                f.to_bits().hash(state);
+            }
+            Value::Char(c) => {
+                TAG_CHAR.hash(state);
+                c.hash(state);
+            }
+            Value::Str(s) => {
+                TAG_STR.hash(state);
+                s.as_str().hash(state);
+            }
+            Value::Bytes(b) => {
+                TAG_BYTES.hash(state);
+                b.as_slice().hash(state);
+            }
+            Value::Type(t) => {
+                TAG_TYPE.hash(state);
+                t.hash(state);
+            }
+            Value::List(l) => {
+                TAG_LIST.hash(state);
+                std::ptr::from_ref(&**l).hash(state);
+            }
+            Value::Map(m) => {
+                TAG_MAP.hash(state);
+                std::ptr::from_ref(&**m).hash(state);
+            }
+            Value::Object(o) => {
+                TAG_OBJECT.hash(state);
+                std::ptr::from_ref(&**o).hash(state);
+            }
+            Value::Native(n) => {
+                TAG_NATIVE.hash(state);
+                std::ptr::from_ref(&**n).hash(state);
+            }
+            Value::User(u) => {
+                TAG_USER.hash(state);
+                u.type_id().hash(state);
+            }
         }
+    }
+}
+
+/// A `&str` standing in for a [`Value::Str`] during a borrowed probe.
+///
+/// Hashes byte-for-byte as `Value::Str` does, which is the only requirement
+/// [`hashbrown`]'s `raw_entry` places on its equivalence closure.
+struct StrTag<'a>(&'a str);
+
+impl Hash for StrTag<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        TAG_STR.hash(state);
+        self.0.hash(state);
     }
 }
 

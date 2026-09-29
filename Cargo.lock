@@ -334,6 +334,8 @@ version = "0.1.0"
 dependencies = [
  "boa_gc",
  "criterion",
+ "foldhash",
+ "hashbrown",
 ]
 
 [[package]]

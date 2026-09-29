@@ -1302,3 +1302,74 @@ fn map_replace_keeps_first_insertion_position() {
     let values: Vec<_> = m.values().filter_map(Value::as_int).collect();
     assert_eq!(values, vec![1, 20, 3]);
 }
+
+#[test]
+fn borrowed_string_lookup_matches_the_owned_key_lookup() {
+    let mut m = ValueMap::new();
+    m.insert(Value::str("alpha"), Value::int(1));
+    m.insert(Value::str("beta"), Value::int(2));
+
+    for key in ["alpha", "beta", "gamma"] {
+        let owned = m.get(&Value::str(key)).and_then(Value::as_int);
+        let borrowed = m.get_str(key).and_then(Value::as_int);
+        assert_eq!(owned, borrowed, "get_str and get must agree for {key:?}");
+        assert_eq!(m.contains_str(key), m.contains_key(&Value::str(key)));
+    }
+}
+
+#[test]
+fn borrowed_string_removal_matches_the_owned_key_removal() {
+    let mut m = ValueMap::new();
+    m.insert(Value::str("a"), Value::int(1));
+    m.insert(Value::str("b"), Value::int(2));
+    m.insert(Value::str("c"), Value::int(3));
+
+    assert_eq!(m.remove_str("b").and_then(|v| v.as_int()), Some(2));
+    assert!(m.get_str("b").is_none());
+    assert_eq!(m.len(), 2);
+    assert_eq!(m.get_str("a").and_then(Value::as_int), Some(1));
+    assert_eq!(m.get_str("c").and_then(Value::as_int), Some(3));
+    assert!(m.remove_str("absent").is_none());
+}
+
+#[test]
+fn a_reserved_map_behaves_identically_to_a_growing_one() {
+    let mut reserved = ValueMap::with_capacity(64);
+    let mut grown = ValueMap::new();
+    for i in 0..64i64 {
+        let key = Value::str(&format!("k{i:03}"));
+        assert_eq!(
+            reserved.insert(key.clone(), Value::int(i)),
+            grown.insert(key, Value::int(i))
+        );
+    }
+    assert_eq!(reserved.len(), grown.len());
+    for i in 0..64i64 {
+        let key = Value::str(&format!("k{i:03}"));
+        assert_eq!(
+            reserved.get(&key).map(|v| v.as_int()),
+            grown.get(&key).map(|v| v.as_int())
+        );
+    }
+    let reserved_keys: Vec<_> = reserved.keys().filter_map(Value::as_str).collect();
+    let grown_keys: Vec<_> = grown.keys().filter_map(Value::as_str).collect();
+    assert_eq!(
+        reserved_keys, grown_keys,
+        "insertion order is unaffected by capacity"
+    );
+}
+
+#[test]
+fn list_extend_appends_in_one_borrow() {
+    let list = Value::list();
+    list.list_extend((0..5).map(Value::int)).unwrap();
+    assert_eq!(list.list_len().unwrap(), 5);
+    assert_eq!(list.list_get(4).unwrap().as_int(), Some(4));
+
+    list.list_extend([Value::str("x"), Value::str("y")])
+        .unwrap();
+    assert_eq!(list.list_len().unwrap(), 7);
+    assert_eq!(list.list_get(6).unwrap().as_str(), Some("y"));
+
+    assert!(Value::int(1).list_extend([Value::int(1)]).is_err());
+}

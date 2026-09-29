@@ -12,6 +12,8 @@ categories = ["memory-management", "data-structures", "rust-patterns", "api-bind
 
 [dependencies]
 boa_gc = "0.22"
+foldhash = "0.2"
+hashbrown = "0.17"
 
 [dev-dependencies]
 criterion = "0.8"
